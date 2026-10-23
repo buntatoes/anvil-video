@@ -24,6 +24,15 @@ pub const MAX_VIDEO_FRAMES: u32 = 36_000;
 /// Maximum compressed packet size per frame (`16 MiB`).
 pub const MAX_PACKET_BYTES: usize = 16 * 1024 * 1024;
 
+/// Maximum total container size accepted by the demuxer (`64 MiB`).
+pub const MAX_CONTAINER_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum number of ISOBMFF boxes (`atoms`) allowed in a single container.
+pub const MAX_MP4_BOXES: usize = 256;
+
+/// Maximum ISOBMFF container box nesting depth.
+pub const MAX_MP4_BOX_DEPTH: usize = 16;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VideoError {
     InvalidHeader,
@@ -31,6 +40,9 @@ pub enum VideoError {
     OddDimensions { width: u32, height: u32 },
     FrameCountTooLarge { count: u32 },
     PacketTooLarge { size: usize },
+    ContainerTooLarge { size: usize },
+    TooManyBoxes { count: usize },
+    BoxDepthExceeded { depth: usize },
     CorruptedBitstream,
     Compression(CompressError),
 }
@@ -57,6 +69,24 @@ impl fmt::Display for VideoError {
                 write!(
                     f,
                     "video packet size {size} exceeds security limit ({MAX_PACKET_BYTES})"
+                )
+            }
+            VideoError::ContainerTooLarge { size } => {
+                write!(
+                    f,
+                    "video container size {size} exceeds security limit ({MAX_CONTAINER_BYTES})"
+                )
+            }
+            VideoError::TooManyBoxes { count } => {
+                write!(
+                    f,
+                    "MP4 container box count {count} exceeds security limit ({MAX_MP4_BOXES})"
+                )
+            }
+            VideoError::BoxDepthExceeded { depth } => {
+                write!(
+                    f,
+                    "MP4 container box nesting depth {depth} exceeds security limit ({MAX_MP4_BOX_DEPTH})"
                 )
             }
             VideoError::CorruptedBitstream => write!(f, "corrupted video bitstream"),
@@ -230,6 +260,39 @@ impl VideoClip {
     pub fn poster_frame(&self) -> Option<&VideoFrame> {
         self.frames.first()
     }
+
+    /// Return the number of `I-frame` keyframes in this clip.
+    pub fn keyframe_count(&self) -> usize {
+        self.frames.iter().filter(|f| f.keyframe).count()
+    }
+
+    /// Return the active [`VideoFrame`] at `timestamp_ms` (clamped to clip duration).
+    pub fn frame_at_ms(&self, timestamp_ms: u32) -> Option<&VideoFrame> {
+        if self.frames.is_empty() {
+            return None;
+        }
+        let mut chosen = &self.frames[0];
+        for frame in &self.frames {
+            if frame.pts_ms <= timestamp_ms {
+                chosen = frame;
+            } else {
+                break;
+            }
+        }
+        Some(chosen)
+    }
+}
+
+/// Lightweight container metadata parsed from an ISOBMFF (`.mp4`) header without decoding `mdat`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mp4Metadata {
+    pub brand: [u8; 4],
+    pub width: u32,
+    pub height: u32,
+    pub timescale: u32,
+    pub duration_ms: u32,
+    pub mdat_size: usize,
+    pub box_count: usize,
 }
 
 /// Stateful GPU video encode & decode session managing `NV12` hardware surfaces and telemetry.
@@ -513,13 +576,106 @@ pub fn wrap_mp4_container(
     out
 }
 
-/// Parse an ISO Base Media File Format (`ISOBMFF` / `.mp4`) container and return the `mdat` bitstream slice.
-pub fn parse_mp4_container(data: &[u8]) -> Result<&[u8], VideoError> {
-    if data.len() < 8 || &data[4..8] != b"ftyp" {
+/// Inspect an ISO Base Media File Format (`ISOBMFF` / `.mp4`) container and return [`Mp4Metadata`]
+/// while enforcing [`MAX_CONTAINER_BYTES`], [`MAX_MP4_BOXES`], and [`MAX_MP4_BOX_DEPTH`].
+pub fn inspect_mp4_metadata(data: &[u8]) -> Result<Mp4Metadata, VideoError> {
+    if data.len() > MAX_CONTAINER_BYTES {
+        return Err(VideoError::ContainerTooLarge { size: data.len() });
+    }
+    if data.len() < 12 || &data[4..8] != b"ftyp" {
         return Err(VideoError::InvalidHeader);
     }
-    let mut cursor = 0usize;
+    let mut meta = Mp4Metadata {
+        brand: [data[8], data[9], data[10], data[11]],
+        width: 0,
+        height: 0,
+        timescale: 1000,
+        duration_ms: 0,
+        mdat_size: 0,
+        box_count: 0,
+    };
     let mut saw_moov = false;
+    let mut saw_mdat = false;
+    scan_mp4_boxes(data, 0, &mut meta, &mut saw_moov, &mut saw_mdat)?;
+    if !saw_moov || !saw_mdat {
+        return Err(VideoError::InvalidHeader);
+    }
+    if meta.width > 0 && meta.height > 0 {
+        validate_video_dimensions(meta.width, meta.height)?;
+    }
+    Ok(meta)
+}
+
+fn scan_mp4_boxes(
+    slice: &[u8],
+    depth: usize,
+    meta: &mut Mp4Metadata,
+    saw_moov: &mut bool,
+    saw_mdat: &mut bool,
+) -> Result<(), VideoError> {
+    if depth > MAX_MP4_BOX_DEPTH {
+        return Err(VideoError::BoxDepthExceeded { depth });
+    }
+    let mut cursor = 0usize;
+    while cursor + 8 <= slice.len() {
+        meta.box_count += 1;
+        if meta.box_count > MAX_MP4_BOXES {
+            return Err(VideoError::TooManyBoxes {
+                count: meta.box_count,
+            });
+        }
+        let box_size = u32::from_be_bytes([
+            slice[cursor],
+            slice[cursor + 1],
+            slice[cursor + 2],
+            slice[cursor + 3],
+        ]) as usize;
+        if box_size < 8 || cursor + box_size > slice.len() {
+            return Err(VideoError::CorruptedBitstream);
+        }
+        let box_type = &slice[cursor + 4..cursor + 8];
+        let payload = &slice[cursor + 8..cursor + box_size];
+        match box_type {
+            b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" => {
+                if box_type == b"moov" {
+                    *saw_moov = true;
+                }
+                scan_mp4_boxes(payload, depth + 1, meta, saw_moov, saw_mdat)?;
+            }
+            b"mvhd" if payload.len() >= 12 => {
+                meta.timescale =
+                    u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]).max(1);
+                meta.duration_ms =
+                    u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
+            }
+            b"tkhd" if payload.len() >= 12 => {
+                meta.width = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                meta.height =
+                    u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
+            }
+            b"mdat" => {
+                if payload.len() > MAX_PACKET_BYTES {
+                    return Err(VideoError::PacketTooLarge {
+                        size: payload.len(),
+                    });
+                }
+                meta.mdat_size = payload.len();
+                *saw_mdat = true;
+            }
+            _ => {}
+        }
+        cursor += box_size;
+    }
+    if cursor != slice.len() {
+        return Err(VideoError::CorruptedBitstream);
+    }
+    Ok(())
+}
+
+/// Parse an ISO Base Media File Format (`ISOBMFF` / `.mp4`) container and return the `mdat` bitstream slice.
+pub fn parse_mp4_container(data: &[u8]) -> Result<&[u8], VideoError> {
+    let _meta = inspect_mp4_metadata(data)?;
+    let mut cursor = 0usize;
     let mut mdat_slice: Option<&[u8]> = None;
 
     while cursor + 8 <= data.len() {
@@ -534,9 +690,7 @@ pub fn parse_mp4_container(data: &[u8]) -> Result<&[u8], VideoError> {
         }
         let box_type = &data[cursor + 4..cursor + 8];
         let payload = &data[cursor + 8..cursor + box_size];
-        if box_type == b"moov" {
-            saw_moov = true;
-        } else if box_type == b"mdat" {
+        if box_type == b"mdat" {
             if payload.len() > MAX_PACKET_BYTES {
                 return Err(VideoError::PacketTooLarge {
                     size: payload.len(),
@@ -547,9 +701,6 @@ pub fn parse_mp4_container(data: &[u8]) -> Result<&[u8], VideoError> {
         cursor += box_size;
     }
 
-    if !saw_moov {
-        return Err(VideoError::InvalidHeader);
-    }
     mdat_slice.ok_or(VideoError::InvalidHeader)
 }
 
@@ -618,8 +769,40 @@ mod tests {
     fn muxes_and_demuxes_isobmff_mp4_video_container() {
         let mp4 = wrap_mp4_container(64, 48, 1000, b"FVID_TEST_STREAM");
         assert_eq!(&mp4[4..8], b"ftyp");
+        let meta = inspect_mp4_metadata(&mp4).unwrap();
+        assert_eq!(meta.brand, *b"isom");
+        assert_eq!(meta.width, 64);
+        assert_eq!(meta.height, 48);
+        assert_eq!(meta.duration_ms, 1000);
         let extracted = parse_mp4_container(&mp4).unwrap();
         assert_eq!(extracted, b"FVID_TEST_STREAM");
+    }
+
+    #[test]
+    fn rejects_deeply_nested_mp4_container_atoms_and_supports_frame_seeking() {
+        let mp4_bytes = generate_demo_mp4(32, 24, 10).unwrap();
+        let mut session = GpuVideoSession::default();
+        let clip = session.decode_video_auto(&mp4_bytes).unwrap();
+        assert_eq!(clip.keyframe_count(), 2);
+        assert_eq!(clip.frame_at_ms(0).unwrap().pts_ms, 0);
+        assert_eq!(clip.frame_at_ms(70).unwrap().pts_ms, 66);
+
+        // Build an adversarial 20-level nested `moov` atom chain exceeding MAX_MP4_BOX_DEPTH (16)
+        let mut nested = Vec::new();
+        write_mp4_box(&mut nested, *b"mvhd", &[0u8; 12]);
+        for _ in 0..20 {
+            let mut parent = Vec::new();
+            write_mp4_box(&mut parent, *b"trak", &nested);
+            nested = parent;
+        }
+        let mut bad_mp4 = Vec::new();
+        write_mp4_box(&mut bad_mp4, *b"ftyp", b"isom\x00\x00\x02\x00isommp42");
+        write_mp4_box(&mut bad_mp4, *b"moov", &nested);
+        write_mp4_box(&mut bad_mp4, *b"mdat", b"FVID");
+        assert!(matches!(
+            inspect_mp4_metadata(&bad_mp4),
+            Err(VideoError::BoxDepthExceeded { .. })
+        ));
     }
 
     #[test]
