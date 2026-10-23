@@ -2,7 +2,7 @@
 
 ## Proof of Concept (PoC) Notice
 
-`flux-video` is a standalone **Proof of Concept (PoC)** GPU-accelerated `NV12`/BT.709 video encoder/decoder, ISOBMFF (`.mp4`) container muxer/demuxer, and ISO/IEC 23001-7 Common Encryption (`CENC`) + W3C Encrypted Media Extensions (`EME`) library authored from scratch by **Buntos** as part of the [**Flux Browser**](https://github.com/buntatoes/flux-browser) engine ecosystem.
+`flux-video` is a standalone **Proof of Concept (PoC)** GPU-accelerated `NV12`/BT.709 video encoder/decoder, ISOBMFF (`.mp4`) container muxer/demuxer, and ISO/IEC 23001-7 Common Encryption (`CENC`) + W3C Encrypted Media Extensions (`EME`) library built from scratch as part of the [**Flux Browser**](https://github.com/buntatoes/flux-browser) engine ecosystem.
 
 ---
 

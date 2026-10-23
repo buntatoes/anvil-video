@@ -10,8 +10,7 @@
   </p>
 </div>
 
-> [!NOTE]
-> **Proof of Concept (PoC) Notice**: `flux-video` is a standalone **Proof of Concept** GPU-accelerated `NV12`/BT.709 video encoder, decoder, ISO Base Media File Format (`ISOBMFF` / `.mp4`) container muxer/demuxer, and ISO/IEC 23001-7 Common Encryption (`CENC`) + W3C Encrypted Media Extensions (`EME` / `CDM`) library authored from scratch by **Buntos** as part of the [**Flux Browser**](https://github.com/buntatoes/flux-browser) engine ecosystem.
+`flux-video` is a standalone GPU-accelerated `NV12`/BT.709 video encoder, decoder, ISO Base Media File Format (`ISOBMFF` / `.mp4`) container muxer/demuxer, and ISO/IEC 23001-7 Common Encryption (`CENC`) + W3C Encrypted Media Extensions (`EME` / `CDM`) library, built from scratch as part of the [**Flux Browser**](https://github.com/buntatoes/flux-browser) Proof of Concept engine ecosystem.
 
 ---
 
