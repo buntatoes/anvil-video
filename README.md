@@ -5,6 +5,7 @@
     <a href="https://github.com/buntatoes/flux-video/releases/tag/v.03"><img src="https://img.shields.io/badge/release-v.03-e8c37a?style=flat-square" alt="Release v.03" /></a>
     <img src="https://img.shields.io/badge/status-Proof_of_Concept_(PoC)-d4a359?style=flat-square" alt="Proof of Concept" />
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MPL--2.0-blue?style=flat-square" alt="License MPL-2.0" /></a>
+    <a href="./SECURITY.md"><img src="https://img.shields.io/badge/security-policy-2ea44f?style=flat-square" alt="Security Policy" /></a>
     <a href="https://github.com/buntatoes/flux-video"><img src="https://img.shields.io/badge/rust-2024_edition-orange?style=flat-square" alt="Rust 2024 Edition" /></a>
   </p>
 </div>
@@ -46,7 +47,23 @@ assert_eq!(clip.frames.len(), 12);
 
 ---
 
+## API Overview
+
+| Type / Function | Description |
+| :--- | :--- |
+| `GpuVideoSession` | Hardware-aware `NV12` video decode & encode session (`D3d11Dxva2`, `LinuxVaApi`, `SoftwareFallback`). |
+| `GpuVideoSession::decode_video_auto(&[u8]) -> Result<VideoClip, VideoError>` | Automatically detects and decodes `.mp4` (unencrypted or `CENC`-encrypted) or raw `FVID` streams. |
+| `CdmSession` / `EmeKeySystem` | W3C Encrypted Media Extensions (`"org.w3.clearkey"`, OS Media Foundation DRM, or External Plugin CDM) license session. |
+| `inspect_mp4_metadata(&[u8]) -> Result<Mp4Metadata, VideoError>` | Inspects ISOBMFF (`ftyp`, `moov`, `trak`, `sinf`, `tenc`, `pssh`) headers and bounds before decoding. |
+| `encode_encrypted_mp4(&VideoClip, key_id, key, iv) -> Result<Vec<u8>, VideoError>` | Encodes a `VideoClip` into an ISO/IEC 23001-7 `cenc` encrypted `.mp4` container. |
+| `generate_demo_mp4` / `generate_encrypted_demo_mp4` | Generates synthetic unencrypted or `CENC`-encrypted `.mp4` test clips. |
+| `validate_video_dimensions(width, height, frames) -> Result<(), VideoError>` | Verifies 4K resolution (`4096x2160`) and frame-count (`36,000`) security bounds. |
+
+---
+
 ## Building and Testing
+
+Ensure [`flux-compress`](https://github.com/buntatoes/flux-compress) (`../flux-compress`) and [`flux-gpu`](https://github.com/buntatoes/flux-gpu) (`../flux-gpu`) are cloned in sibling directories, then run:
 
 ```powershell
 cargo test
