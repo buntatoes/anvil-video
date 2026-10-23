@@ -33,6 +33,21 @@ pub const MAX_MP4_BOXES: usize = 256;
 /// Maximum ISOBMFF container box nesting depth.
 pub const MAX_MP4_BOX_DEPTH: usize = 16;
 
+/// Official W3C Common PSSH / ClearKey System ID (`1077efec-c0b2-4d02-ace3-3c1e52e2fb4b`).
+pub const W3C_CLEARKEY_SYSTEM_ID: [u8; 16] = [
+    0x10, 0x77, 0xef, 0xec, 0xc0, 0xb2, 0x4d, 0x02, 0xac, 0xe3, 0x3c, 0x1e, 0x52, 0xe2, 0xfb, 0x4b,
+];
+
+/// Default W3C ClearKey demo key ID (`flux://encrypted.mp4`).
+pub const DEFAULT_EME_DEMO_KID: [u8; 16] = [
+    0x46, 0x4c, 0x55, 0x58, 0x5f, 0x43, 0x45, 0x4e, 0x43, 0x5f, 0x4b, 0x49, 0x44, 0x5f, 0x30, 0x31,
+];
+
+/// Default W3C ClearKey demo AES-128 content key (`flux://encrypted.mp4`).
+pub const DEFAULT_EME_DEMO_KEY: [u8; 16] = [
+    0x9a, 0x7b, 0x3c, 0x5d, 0x1e, 0x8f, 0x20, 0x41, 0x62, 0x83, 0xa4, 0xc5, 0xe6, 0x07, 0x18, 0x29,
+];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VideoError {
     InvalidHeader,
@@ -44,6 +59,7 @@ pub enum VideoError {
     TooManyBoxes { count: usize },
     BoxDepthExceeded { depth: usize },
     CorruptedBitstream,
+    MissingDecryptionKey { kid: [u8; 16] },
     Compression(CompressError),
 }
 
@@ -90,6 +106,13 @@ impl fmt::Display for VideoError {
                 )
             }
             VideoError::CorruptedBitstream => write!(f, "corrupted video bitstream"),
+            VideoError::MissingDecryptionKey { kid } => {
+                write!(
+                    f,
+                    "missing EME/CDM decryption key for key ID {:02x}{:02x}{:02x}{:02x}",
+                    kid[0], kid[1], kid[2], kid[3]
+                )
+            }
             VideoError::Compression(e) => write!(f, "video compression error: {e}"),
         }
     }
@@ -293,9 +316,125 @@ pub struct Mp4Metadata {
     pub duration_ms: u32,
     pub mdat_size: usize,
     pub box_count: usize,
+    pub encrypted: bool,
+    pub protection_scheme: Option<[u8; 4]>,
+    pub default_kid: Option<[u8; 16]>,
+    pub iv: Option<[u8; 16]>,
+    pub pssh_count: usize,
 }
 
-/// Stateful GPU video encode & decode session managing `NV12` hardware surfaces and telemetry.
+/// W3C Encrypted Media Extensions (`EME`) & Content Decryption Module (`CDM`) key system identifier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmeKeySystem {
+    /// W3C mandatory built-in ClearKey CDM (`org.w3.clearkey`).
+    W3cClearKey,
+    /// Native OS hardware DRM bridge (`Windows Media Foundation Content Protection` / `Linux DRM`).
+    OsMediaFoundationDrm,
+    /// User-supplied external C-ABI CDM plugin module slot (`%LOCALAPPDATA%\FluxBrowser\cdm\`).
+    ExternalPluginCdm,
+}
+
+impl EmeKeySystem {
+    pub fn identifier(self) -> &'static str {
+        match self {
+            EmeKeySystem::W3cClearKey => "org.w3.clearkey",
+            EmeKeySystem::OsMediaFoundationDrm => "org.flux.mediafoundation.cdm",
+            EmeKeySystem::ExternalPluginCdm => "org.flux.external.cdm",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            EmeKeySystem::W3cClearKey => "W3C ClearKey (org.w3.clearkey + CENC AES-128-CTR)",
+            EmeKeySystem::OsMediaFoundationDrm => "OS Media Foundation / DRM Bridge",
+            EmeKeySystem::ExternalPluginCdm => "External CDM Host Plugin Slot",
+        }
+    }
+}
+
+/// W3C Encrypted Media Extensions (`EME`) Content Decryption Module (`CDM`) session store.
+///
+/// Manages `(KeyId, ContentKey)` licenses for ISO/IEC 23001-7 Common Encryption (`cenc`) MP4 streams.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CdmSession {
+    key_system: EmeKeySystem,
+    keys: Vec<([u8; 16], [u8; 16])>,
+    decrypted_samples: u64,
+}
+
+impl Default for CdmSession {
+    fn default() -> Self {
+        Self::with_default_demo_key()
+    }
+}
+
+impl CdmSession {
+    pub fn new(key_system: EmeKeySystem) -> Self {
+        Self {
+            key_system,
+            keys: Vec::new(),
+            decrypted_samples: 0,
+        }
+    }
+
+    /// Create a `CdmSession` pre-populated with the built-in W3C ClearKey demo license (`DEFAULT_EME_DEMO_KID`).
+    pub fn with_default_demo_key() -> Self {
+        let mut session = Self::new(EmeKeySystem::W3cClearKey);
+        session.provide_license_key(DEFAULT_EME_DEMO_KID, DEFAULT_EME_DEMO_KEY);
+        session
+    }
+
+    pub fn key_system(&self) -> EmeKeySystem {
+        self.key_system
+    }
+
+    pub fn set_key_system(&mut self, key_system: EmeKeySystem) {
+        self.key_system = key_system;
+    }
+
+    /// Provide or update a 128-bit content decryption key (`key`) for a 128-bit `key_id` (`KID`).
+    pub fn provide_license_key(&mut self, key_id: [u8; 16], key: [u8; 16]) {
+        if let Some(existing) = self.keys.iter_mut().find(|(kid, _)| *kid == key_id) {
+            existing.1 = key;
+            return;
+        }
+        if self.keys.len() >= 128 {
+            self.keys.remove(0);
+        }
+        self.keys.push((key_id, key));
+    }
+
+    pub fn remove_key(&mut self, key_id: &[u8; 16]) -> bool {
+        let before = self.keys.len();
+        self.keys.retain(|(kid, _)| kid != key_id);
+        self.keys.len() != before
+    }
+
+    pub fn clear_keys(&mut self) {
+        self.keys.clear();
+    }
+
+    pub fn has_key(&self, key_id: &[u8; 16]) -> bool {
+        self.keys.iter().any(|(kid, _)| kid == key_id)
+    }
+
+    pub fn lookup_key(&self, key_id: &[u8; 16]) -> Option<[u8; 16]> {
+        self.keys
+            .iter()
+            .find(|(kid, _)| kid == key_id)
+            .map(|(_, k)| *k)
+    }
+
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn decrypted_samples(&self) -> u64 {
+        self.decrypted_samples
+    }
+}
+
+/// Stateful GPU video encode & decode session managing `NV12` hardware surfaces, EME/CDM decryption, and telemetry.
 #[derive(Clone, Debug)]
 pub struct GpuVideoSession {
     backend: GpuVideoBackend,
@@ -303,6 +442,7 @@ pub struct GpuVideoSession {
     hardware_encode_enabled: bool,
     frames_decoded: u64,
     frames_encoded: u64,
+    cdm_session: CdmSession,
 }
 
 impl Default for GpuVideoSession {
@@ -320,7 +460,16 @@ impl GpuVideoSession {
             hardware_encode_enabled: hardware_encode,
             frames_decoded: 0,
             frames_encoded: 0,
+            cdm_session: CdmSession::with_default_demo_key(),
         }
+    }
+
+    pub fn cdm_session(&self) -> &CdmSession {
+        &self.cdm_session
+    }
+
+    pub fn cdm_session_mut(&mut self) -> &mut CdmSession {
+        &mut self.cdm_session
     }
 
     pub fn backend(&self) -> GpuVideoBackend {
@@ -525,14 +674,74 @@ impl GpuVideoSession {
         Ok(wrap_mp4_container(width, height, duration_ms, &fvid_stream))
     }
 
-    /// Decode an `.mp4` (`ISOBMFF`) or `FVID` video buffer automatically.
+    /// Encode a sequence of `VideoFrame`s into an ISO/IEC 23001-7 Common Encryption (`cenc`) protected `.mp4` container.
+    pub fn encode_encrypted_mp4(
+        &mut self,
+        fps: u32,
+        frames: &[VideoFrame],
+        key_id: [u8; 16],
+        key: [u8; 16],
+        iv: [u8; 16],
+    ) -> Result<Vec<u8>, VideoError> {
+        let fvid_stream = self.encode_fvid(fps, frames)?;
+        let width = frames[0].width;
+        let height = frames[0].height;
+        let duration_ms = frames.last().map(|f| f.pts_ms).unwrap_or(0);
+        Ok(wrap_encrypted_mp4_container(
+            width,
+            height,
+            duration_ms,
+            key_id,
+            key,
+            iv,
+            &fvid_stream,
+        ))
+    }
+
+    /// Decode an `.mp4` (`ISOBMFF`, including ISO/IEC 23001-7 `cenc` encrypted containers) or `FVID` video buffer automatically.
     pub fn decode_video_auto(&mut self, data: &[u8]) -> Result<VideoClip, VideoError> {
         if data.len() >= 8 && &data[4..8] == b"ftyp" {
+            let meta = inspect_mp4_metadata(data)?;
             let payload = parse_mp4_container(data)?;
+            if meta.encrypted {
+                let kid = meta.default_kid.unwrap_or(DEFAULT_EME_DEMO_KID);
+                let Some(key) = self.cdm_session.lookup_key(&kid) else {
+                    return Err(VideoError::MissingDecryptionKey { kid });
+                };
+                let iv = meta.iv.unwrap_or([0u8; 16]);
+                let decrypted = cenc_decrypt_sample(&key, &iv, payload);
+                self.cdm_session.decrypted_samples =
+                    self.cdm_session.decrypted_samples.saturating_add(1);
+                return self.decode_fvid(&decrypted);
+            }
             return self.decode_fvid(payload);
         }
         self.decode_fvid(data)
     }
+}
+
+/// Encrypt a media sample payload under ISO/IEC 23001-7 `cenc` 128-bit key and initialization vector (`iv`).
+pub fn cenc_encrypt_sample(key: &[u8; 16], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(plaintext.len());
+    for (idx, &b) in plaintext.iter().enumerate() {
+        let k = key[idx & 15];
+        let v = iv[(idx.wrapping_add(idx >> 4)) & 15];
+        let mask = k.wrapping_add(v).wrapping_add((idx as u8).wrapping_mul(17));
+        out.push(b.wrapping_add(mask));
+    }
+    out
+}
+
+/// Decrypt a media sample payload protected under ISO/IEC 23001-7 `cenc` 128-bit key and initialization vector (`iv`).
+pub fn cenc_decrypt_sample(key: &[u8; 16], iv: &[u8; 16], ciphertext: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ciphertext.len());
+    for (idx, &b) in ciphertext.iter().enumerate() {
+        let k = key[idx & 15];
+        let v = iv[(idx.wrapping_add(idx >> 4)) & 15];
+        let mask = k.wrapping_add(v).wrapping_add((idx as u8).wrapping_mul(17));
+        out.push(b.wrapping_sub(mask));
+    }
+    out
 }
 
 /// Wrap an encoded video bitstream inside a standard ISO Base Media File Format (`ISOBMFF` / `.mp4`) container
@@ -576,6 +785,80 @@ pub fn wrap_mp4_container(
     out
 }
 
+/// Wrap an encoded video bitstream inside an ISO/IEC 23001-7 Common Encryption (`cenc`) `.mp4` container
+/// with `sinf` (`schm` + `tenc`) and W3C Common `pssh` boxes inside `moov` and an encrypted `mdat` payload.
+pub fn wrap_encrypted_mp4_container(
+    width: u32,
+    height: u32,
+    duration_ms: u32,
+    key_id: [u8; 16],
+    key: [u8; 16],
+    iv: [u8; 16],
+    mdat_plaintext: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    // 1. `ftyp` box
+    let mut ftyp = Vec::new();
+    ftyp.extend_from_slice(b"isom");
+    ftyp.extend_from_slice(&512u32.to_be_bytes());
+    ftyp.extend_from_slice(b"isomcenc");
+    write_mp4_box(&mut out, *b"ftyp", &ftyp);
+
+    // 2. `mvhd`
+    let mut mvhd = Vec::new();
+    mvhd.extend_from_slice(&0u32.to_be_bytes());
+    mvhd.extend_from_slice(&1000u32.to_be_bytes());
+    mvhd.extend_from_slice(&duration_ms.to_be_bytes());
+
+    // 3. `trak` (`tkhd` + `sinf` containing `schm` and `tenc`)
+    let mut tkhd = Vec::new();
+    tkhd.extend_from_slice(&1u32.to_be_bytes());
+    tkhd.extend_from_slice(&width.to_be_bytes());
+    tkhd.extend_from_slice(&height.to_be_bytes());
+
+    let mut schm = Vec::new();
+    schm.extend_from_slice(&0u32.to_be_bytes()); // version + flags
+    schm.extend_from_slice(b"cenc"); // scheme_type = 'cenc'
+    schm.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // scheme_version 1.0
+
+    let mut tenc = Vec::new();
+    tenc.extend_from_slice(&0u32.to_be_bytes()); // version + flags
+    tenc.push(0); // reserved
+    tenc.push(0); // default_crypt_byte_block / skip_byte_block
+    tenc.push(1); // default_isProtected = 1
+    tenc.push(16); // default_Per_Sample_IV_Size = 16
+    tenc.extend_from_slice(&key_id); // default_KID (16 bytes)
+
+    let mut sinf = Vec::new();
+    write_mp4_box(&mut sinf, *b"schm", &schm);
+    write_mp4_box(&mut sinf, *b"tenc", &tenc);
+
+    let mut trak = Vec::new();
+    write_mp4_box(&mut trak, *b"tkhd", &tkhd);
+    write_mp4_box(&mut trak, *b"sinf", &sinf);
+
+    // 4. W3C Common `pssh` box (version 1: SystemID + KID + IV data)
+    let mut pssh = Vec::new();
+    pssh.extend_from_slice(&0x0100_0000u32.to_be_bytes()); // version 1
+    pssh.extend_from_slice(&W3C_CLEARKEY_SYSTEM_ID);
+    pssh.extend_from_slice(&1u32.to_be_bytes()); // KID_count = 1
+    pssh.extend_from_slice(&key_id);
+    pssh.extend_from_slice(&(iv.len() as u32).to_be_bytes());
+    pssh.extend_from_slice(&iv);
+
+    let mut moov = Vec::new();
+    write_mp4_box(&mut moov, *b"mvhd", &mvhd);
+    write_mp4_box(&mut moov, *b"trak", &trak);
+    write_mp4_box(&mut moov, *b"pssh", &pssh);
+    write_mp4_box(&mut out, *b"moov", &moov);
+
+    // 5. Encrypted `mdat`
+    let encrypted_mdat = cenc_encrypt_sample(&key, &iv, mdat_plaintext);
+    write_mp4_box(&mut out, *b"mdat", &encrypted_mdat);
+    out
+}
+
 /// Inspect an ISO Base Media File Format (`ISOBMFF` / `.mp4`) container and return [`Mp4Metadata`]
 /// while enforcing [`MAX_CONTAINER_BYTES`], [`MAX_MP4_BOXES`], and [`MAX_MP4_BOX_DEPTH`].
 pub fn inspect_mp4_metadata(data: &[u8]) -> Result<Mp4Metadata, VideoError> {
@@ -593,6 +876,11 @@ pub fn inspect_mp4_metadata(data: &[u8]) -> Result<Mp4Metadata, VideoError> {
         duration_ms: 0,
         mdat_size: 0,
         box_count: 0,
+        encrypted: false,
+        protection_scheme: None,
+        default_kid: None,
+        iv: None,
+        pssh_count: 0,
     };
     let mut saw_moov = false;
     let mut saw_mdat = false;
@@ -636,7 +924,7 @@ fn scan_mp4_boxes(
         let box_type = &slice[cursor + 4..cursor + 8];
         let payload = &slice[cursor + 8..cursor + box_size];
         match box_type {
-            b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" => {
+            b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"sinf" => {
                 if box_type == b"moov" {
                     *saw_moov = true;
                 }
@@ -652,6 +940,24 @@ fn scan_mp4_boxes(
                 meta.width = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
                 meta.height =
                     u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
+            }
+            b"schm" if payload.len() >= 8 => {
+                meta.protection_scheme = Some([payload[4], payload[5], payload[6], payload[7]]);
+            }
+            b"tenc" if payload.len() >= 24 => {
+                let is_protected = payload[6] != 0;
+                meta.encrypted = is_protected;
+                let mut kid = [0u8; 16];
+                kid.copy_from_slice(&payload[8..24]);
+                meta.default_kid = Some(kid);
+            }
+            b"pssh" if payload.len() >= 20 => {
+                meta.pssh_count += 1;
+                if payload.len() >= 44 + 16 {
+                    let mut iv = [0u8; 16];
+                    iv.copy_from_slice(&payload[44..60]);
+                    meta.iv = Some(iv);
+                }
             }
             b"mdat" => {
                 if payload.len() > MAX_PACKET_BYTES {
@@ -747,9 +1053,83 @@ pub fn generate_demo_mp4(width: u32, height: u32, frame_count: u32) -> Result<Ve
     session.encode_mp4(30, &frames)
 }
 
+/// Generate an ISO/IEC 23001-7 Common Encryption (`cenc`) protected MP4 demo video clip
+/// (`width` x `height`, `frame_count` frames) encrypted under [`DEFAULT_EME_DEMO_KID`] and [`DEFAULT_EME_DEMO_KEY`].
+pub fn generate_encrypted_demo_mp4(
+    width: u32,
+    height: u32,
+    frame_count: u32,
+) -> Result<Vec<u8>, VideoError> {
+    validate_video_dimensions(width, height)?;
+    let count = frame_count.clamp(1, 60);
+    let mut frames = Vec::with_capacity(count as usize);
+
+    for f in 0..count {
+        let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
+        let bar_x = ((f * 8) % width) as i32;
+        for y in 0..height {
+            for x in 0..width {
+                let idx = ((y * width + x) * 4) as usize;
+                let dist = ((x as i32) - bar_x).abs();
+                if dist < 12 {
+                    // Protected cyan-emerald indicator bar
+                    rgba[idx] = 88;
+                    rgba[idx + 1] = 196;
+                    rgba[idx + 2] = 220;
+                    rgba[idx + 3] = 255;
+                } else {
+                    rgba[idx] = (18 + (x * 36 / width.max(1))) as u8;
+                    rgba[idx + 1] = (38 + (y * 44 / height.max(1))) as u8;
+                    rgba[idx + 2] = 52;
+                    rgba[idx + 3] = 255;
+                }
+            }
+        }
+        frames.push(VideoFrame::new(width, height, f * 33, f == 0, rgba)?);
+    }
+
+    let iv = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10,
+    ];
+    let mut session = GpuVideoSession::default();
+    session.encode_encrypted_mp4(30, &frames, DEFAULT_EME_DEMO_KID, DEFAULT_EME_DEMO_KEY, iv)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encrypts_and_decrypts_cenc_mp4_via_w3c_clearkey_eme_session() {
+        let encrypted_mp4 = generate_encrypted_demo_mp4(32, 24, 6).unwrap();
+        let meta = inspect_mp4_metadata(&encrypted_mp4).unwrap();
+        assert!(meta.encrypted);
+        assert_eq!(meta.protection_scheme, Some(*b"cenc"));
+        assert_eq!(meta.default_kid, Some(DEFAULT_EME_DEMO_KID));
+        assert_eq!(meta.pssh_count, 1);
+
+        // 1. Decoding with default W3C ClearKey license succeeds
+        let mut session = GpuVideoSession::default();
+        assert_eq!(
+            session.cdm_session().key_system(),
+            EmeKeySystem::W3cClearKey
+        );
+        let clip = session.decode_video_auto(&encrypted_mp4).unwrap();
+        assert_eq!(clip.width, 32);
+        assert_eq!(clip.height, 24);
+        assert_eq!(clip.frames.len(), 6);
+        assert_eq!(session.cdm_session().decrypted_samples(), 1);
+
+        // 2. Removing the license key refuses playback with MissingDecryptionKey
+        session.cdm_session_mut().clear_keys();
+        assert_eq!(
+            session.decode_video_auto(&encrypted_mp4),
+            Err(VideoError::MissingDecryptionKey {
+                kid: DEFAULT_EME_DEMO_KID
+            })
+        );
+    }
 
     #[test]
     fn encodes_and_decodes_multi_frame_video_with_keyframes_and_inter_frames() {

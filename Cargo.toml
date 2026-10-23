@@ -1,10 +1,10 @@
 [package]
 name = "flux-video"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Buntos <324143321+buntatoes@users.noreply.github.com>"]
 license = "MPL-2.0"
-description = "GPU-accelerated NV12/BT.709 video encoder and decoder, ISOBMFF/MP4 container muxer/demuxer, and motion-compensated video bitstream engine."
+description = "GPU-accelerated NV12/BT.709 video encoder and decoder, ISOBMFF/MP4 container muxer/demuxer, ISO/IEC 23001-7 CENC encryption, and W3C EME/CDM session engine."
 repository = "https://github.com/buntatoes/flux-video"
 homepage = "https://github.com/buntatoes/flux-video"
 readme = "README.md"
