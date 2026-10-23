@@ -1,10 +1,16 @@
-# flux-video
+<div align="center">
+  <h1>flux-video</h1>
+  <p><strong>GPU-Accelerated NV12/BT.709 Video Codec, ISOBMFF/MP4 Container Engine &amp; ISO/IEC 23001-7 CENC / W3C EME Session (Proof of Concept)</strong></p>
+  <p>
+    <a href="https://github.com/buntatoes/flux-video/releases/tag/v.03"><img src="https://img.shields.io/badge/release-v.03-e8c37a?style=flat-square" alt="Release v.03" /></a>
+    <img src="https://img.shields.io/badge/status-Proof_of_Concept_(PoC)-d4a359?style=flat-square" alt="Proof of Concept" />
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MPL--2.0-blue?style=flat-square" alt="License MPL-2.0" /></a>
+    <a href="https://github.com/buntatoes/flux-video"><img src="https://img.shields.io/badge/rust-2024_edition-orange?style=flat-square" alt="Rust 2024 Edition" /></a>
+  </p>
+</div>
 
-[![Release](https://img.shields.io/badge/release-v.03-e8c37a)](https://github.com/buntatoes/flux-video/releases/tag/v.03)
-[![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](./LICENSE)
-[![Edition](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://github.com/buntatoes/flux-video)
-
-`flux-video` is the standalone GPU-accelerated `NV12`/BT.709 video encoder, decoder, ISO Base Media File Format (`ISOBMFF` / `.mp4`) container, and ISO/IEC 23001-7 Common Encryption (`CENC`) + W3C Encrypted Media Extensions (`EME` / `CDM`) library for the Flux rendering engine.
+> [!NOTE]
+> **Proof of Concept (PoC) Notice**: `flux-video` is a standalone **Proof of Concept** GPU-accelerated `NV12`/BT.709 video encoder, decoder, ISO Base Media File Format (`ISOBMFF` / `.mp4`) container muxer/demuxer, and ISO/IEC 23001-7 Common Encryption (`CENC`) + W3C Encrypted Media Extensions (`EME` / `CDM`) library authored from scratch by **Buntos** as part of the [**Flux Browser**](https://github.com/buntatoes/flux-browser) engine ecosystem.
 
 ---
 
@@ -54,4 +60,4 @@ Licensed under the Mozilla Public License Version 2.0 ([`MPL-2.0`](./LICENSE)).
 
 ## Author
 
-**Buntos**
+**Buntos** ([@buntatoes](https://github.com/buntatoes))

@@ -1,5 +1,6 @@
-//! Proprietary GPU-accelerated `NV12`/BT.709 video encoder, decoder, and ISOBMFF/MP4 container engine.
+//! GPU-accelerated `NV12`/BT.709 video encoder, decoder, and ISOBMFF/MP4 container engine (Proof of Concept).
 //!
+//! Standalone `MPL-2.0` companion library for the Flux Browser Proof of Concept ecosystem.
 //! Coordinates hardware `NV12` GPU video surfaces (Direct3D 11 Video / DXVA2 on Windows and
 //! VA-API on Linux via `flux-gpu`) alongside a deterministic keyframe (`I-frame`) and
 //! temporal residual (`P-frame`) video codec and ISOBMFF (`.mp4`) container muxer/demuxer.
