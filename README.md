@@ -1,6 +1,16 @@
-# flux-video
+<div align="center">
+  <h1>flux-video</h1>
+  <p>CPU frames in a small MP4 container, plus AES-128-CTR samples.</p>
+  <p>
+    <img src="https://img.shields.io/badge/release-v.04-e8c37a?style=flat-square" alt="v.04" />
+    <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MPL--2.0-blue?style=flat-square" alt="MPL-2.0" /></a>
+    <a href="./SECURITY.md"><img src="https://img.shields.io/badge/security-policy-2ea44f?style=flat-square" alt="Security" /></a>
+    <img src="https://img.shields.io/badge/rust-2024-orange?style=flat-square" alt="Rust 2024" />
+  </p>
+</div>
 
-CPU video frames, a small MP4 container, and AES-128-CTR samples. Version 0.4.0.
+Version 0.4.0.
 
 It needs these directories next to this one:
 
