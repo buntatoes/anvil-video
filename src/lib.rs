@@ -1,9 +1,6 @@
-//! GPU-accelerated `NV12`/BT.709 video encoder, decoder, and ISOBMFF/MP4 container engine (Proof of Concept).
+//! CPU video frames, a small MP4 container, and AES-128-CTR samples.
 //!
-//! Standalone `MPL-2.0` companion library for the Flux Browser Proof of Concept ecosystem.
-//! Coordinates hardware `NV12` GPU video surfaces (Direct3D 11 Video / DXVA2 on Windows and
-//! VA-API on Linux via `flux-gpu`) alongside a deterministic keyframe (`I-frame`) and
-//! temporal residual (`P-frame`) video codec and ISOBMFF (`.mp4`) container muxer/demuxer.
+//! Depends on `flux-cipher`, `flux-compress`, and `flux-gpu`. No hardware decoder.
 
 use std::fmt;
 
@@ -128,15 +125,14 @@ impl From<CompressError> for VideoError {
     }
 }
 
-/// Hardware GPU video acceleration backend.
+/// A name for where frames might be decoded. This crate does not open a GPU device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GpuVideoBackend {
-    /// Windows Direct3D 11 Video / Media Foundation DXVA2 (`ID3D11VideoDevice` / `ID3D11VideoContext`
-    /// driving NVIDIA NVDEC/NVENC, AMD AMF/VCN, and Intel QuickSync on `NV12` textures).
+    /// Label only. No Direct3D calls.
     D3d11Dxva2,
-    /// Linux VA-API / DRM `NV12` hardware video acceleration (`libva`).
+    /// Label only. No VA-API calls.
     LinuxVaApi,
-    /// Software CPU `NV12` / BT.709 fallback pipeline.
+    /// Frames are converted on the CPU.
     SoftwareFallback,
 }
 
@@ -154,14 +150,14 @@ impl GpuVideoBackend {
     }
 }
 
-/// Supported video codec profiles.
+/// FourCC label. This crate does not decode H.264 or AV1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VideoCodecProfile {
-    /// Hardware H.264 / AVC High Profile (`avc1`).
+    /// Label `avc1`. Not an H.264 decoder.
     H264High,
-    /// Hardware AV1 Main Profile (`av01`).
+    /// Label `av01`. Not an AV1 decoder.
     Av1Main,
-    /// Flux native `NV12` keyframe + temporal residual stream (`FVID`).
+    /// The frame format this crate actually reads and writes (`FVID`).
     FluxNv12Temporal,
 }
 
@@ -175,7 +171,7 @@ impl VideoCodecProfile {
     }
 }
 
-/// Probe the platform's native hardware GPU video decode/encode backend.
+/// Returns a backend name from the operating system. It does not check for a GPU.
 pub fn probe_platform_gpu_backend(hardware_enabled: bool) -> GpuVideoBackend {
     if !hardware_enabled {
         return GpuVideoBackend::SoftwareFallback;
