@@ -1,24 +1,24 @@
-# CPU frames in a small MP4 container. Frame packets use flux-compress (zlib).
-# Sample encryption uses flux-cipher (AES-128-CTR). Plane conversion uses
-# flux-gpu on the CPU. No hardware decoder.
-# Caller: flux-browser. flux-dom only records the video URL and does not
-# link this crate. flux-raster does not link this crate either.
+# CPU frames in a small MP4 container. Frame packets use root-compress (zlib).
+# Sample encryption uses root-cipher (AES-128-CTR). Plane conversion uses
+# root-gpu on the CPU. No hardware decoder.
+# Caller: root-browser. root-dom only records the video URL and does not
+# link this crate. root-raster does not link this crate either.
 
 [package]
-name = "flux-video"
+name = "root-video"
 version = "0.4.0"
 edition = "2024"
 authors = ["Buntos <324143321+buntatoes@users.noreply.github.com>"]
 license = "MPL-2.0"
 description = "CPU video frames in a small MP4 container, plus AES-128-CTR samples. No hardware decoder."
-repository = "https://github.com/buntatoes/flux-video"
-homepage = "https://github.com/buntatoes/flux-video"
+repository = "https://github.com/buntatoes/root-video"
+homepage = "https://github.com/buntatoes/root-video"
 readme = "README.md"
 keywords = ["video", "mp4", "aes"]
 categories = ["multimedia::video", "rendering"]
 publish = false
 
 [dependencies]
-flux-cipher = { path = "../flux-cipher" }
-flux-compress = { path = "../flux-compress" }
-flux-gpu = { path = "../flux-gpu" }
+root-cipher = { path = "../root-cipher" }
+root-compress = { path = "../root-compress" }
+root-gpu = { path = "../root-gpu" }

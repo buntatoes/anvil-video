@@ -2,11 +2,11 @@
 
 Report problems in private:
 
-https://github.com/buntatoes/flux-video/security/advisories/new
+https://github.com/buntatoes/root-video/security/advisories/new
 
 The browser repository takes the same kind of report:
 
-https://github.com/buntatoes/flux-browser/security/advisories/new
+https://github.com/buntatoes/root-browser/security/advisories/new
 
 Do not put the details in a public issue.
 
@@ -14,7 +14,7 @@ Do not put the details in a public issue.
 
 - Dimensions, pixel count, container size, packet size, and MP4 box depth are capped.
 - An encrypted sample without a matching key is not decoded.
-- AES-128-CTR itself is in `flux-cipher`. A wrong key does not fail a tag check, because CTR has no tag. The caller has to know the key.
+- AES-128-CTR itself is in `root-cipher`. A wrong key does not fail a tag check, because CTR has no tag. The caller has to know the key.
 
 ## What is not here
 
