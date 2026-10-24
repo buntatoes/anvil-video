@@ -1,3 +1,9 @@
+# CPU frames in a small MP4 container. Frame packets use flux-compress (zlib).
+# Sample encryption uses flux-cipher (AES-128-CTR). Plane conversion uses
+# flux-gpu on the CPU. No hardware decoder.
+# Caller: flux-browser. flux-dom only records the video URL and does not
+# link this crate. flux-raster does not link this crate either.
+
 [package]
 name = "flux-video"
 version = "0.4.0"
