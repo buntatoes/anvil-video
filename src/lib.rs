@@ -26,8 +26,9 @@
 //! Three sibling crates are called, and only for these calls:
 //! - `anvil-compress`: `compress_zlib` on encode, `decompress_zlib_bounded` on decode.
 //! - `anvil-cipher`: `aes128_ctr` from both sample functions above.
-//! - `anvil-gpu`: `Nv12Surface::from_rgba_bt709` and `Nv12Surface::to_rgba_bt709`,
-//!   which convert color in memory on the CPU.
+//! - `anvil-gpu`: `convert_rgba_on_device` and `present_nv12_on_device` when the
+//!   hardware flag is set. Those calls shade through the tile device. The flag-off
+//!   path still uses `Nv12Surface` directly.
 //!
 //! Not implemented: a hardware decoder, a GPU decode or encode session, H.264, AV1,
 //! and a full sample-encryption layout (no `senc`, `saiz`, `saio`, or subsample
@@ -43,7 +44,7 @@ use std::fmt;
 
 use anvil_cipher::aes128_ctr;
 use anvil_compress::{CompressError, compress_zlib, decompress_zlib_bounded};
-use anvil_gpu::Nv12Surface;
+use anvil_gpu::{Nv12Surface, convert_rgba_on_device, present_nv12_on_device};
 
 /// Largest accepted frame width, in pixels.
 pub const MAX_VIDEO_WIDTH: u32 = 4096;
@@ -742,7 +743,12 @@ impl GpuVideoSession {
             if frame.width != width || frame.height != height {
                 return Err(VideoError::InvalidHeader);
             }
-            let curr_nv12 = frame.to_nv12_surface()?;
+            let curr_nv12 = if self.hardware_encode_enabled {
+                convert_rgba_on_device(frame.width, frame.height, &frame.rgba)
+                    .ok_or(VideoError::InvalidHeader)?
+            } else {
+                frame.to_nv12_surface()?
+            };
             let is_keyframe = idx == 0 || frame.keyframe || (idx % 8 == 0);
 
             let mut raw_plane_payload =
@@ -867,7 +873,12 @@ impl GpuVideoSession {
                 }
             }
 
-            let decoded_frame = VideoFrame::from_nv12_surface(&ref_surface, pts_ms, is_keyframe)?;
+            let decoded_frame = if self.hardware_decode_enabled {
+                let rgba = present_nv12_on_device(&ref_surface);
+                VideoFrame::new(ref_surface.width, ref_surface.height, pts_ms, is_keyframe, rgba)?
+            } else {
+                VideoFrame::from_nv12_surface(&ref_surface, pts_ms, is_keyframe)?
+            };
             frames.push(decoded_frame);
             self.frames_decoded += 1;
         }
@@ -1512,5 +1523,22 @@ mod tests {
         assert!(session.backend().is_hardware_accelerated());
         session.set_hardware_acceleration(false, false);
         assert_eq!(session.backend(), GpuVideoBackend::SoftwareFallback);
+    }
+
+    #[test]
+    fn encode_and_decode_run_plane_conversion_on_the_device() {
+        let converts = anvil_gpu::device_converts();
+        let presents = anvil_gpu::device_presents();
+        let rgba = vec![10u8, 180, 40, 255].repeat(8);
+        let frame = VideoFrame::new(4, 2, 0, true, rgba.clone()).unwrap();
+        let mut session = GpuVideoSession::new(true, true);
+        let bytes = session.encode_fvid(30, &[frame]).unwrap();
+        let clip = session.decode_fvid(&bytes).unwrap();
+        assert_eq!(clip.frames.len(), 1);
+        assert!(anvil_gpu::device_converts() > converts);
+        assert!(anvil_gpu::device_presents() > presents);
+        let back = &clip.frames[0].rgba;
+        assert_eq!(back.len(), rgba.len());
+        assert!((back[0] as i16 - rgba[0] as i16).abs() < 40);
     }
 }
