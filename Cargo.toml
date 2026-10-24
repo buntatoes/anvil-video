@@ -16,6 +16,7 @@ homepage = "https://github.com/buntatoes/flux-video"
 readme = "README.md"
 keywords = ["video", "mp4", "aes"]
 categories = ["multimedia::video", "rendering"]
+publish = false
 
 [dependencies]
 flux-cipher = { path = "../flux-cipher" }
