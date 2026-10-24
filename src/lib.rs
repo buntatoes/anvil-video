@@ -7,6 +7,7 @@
 
 use std::fmt;
 
+use flux_cipher::aes128_ctr;
 use flux_compress::{CompressError, compress_zlib, decompress_zlib_bounded};
 use flux_gpu::Nv12Surface;
 
@@ -721,28 +722,14 @@ impl GpuVideoSession {
     }
 }
 
-/// Encrypt a media sample payload under ISO/IEC 23001-7 `cenc` 128-bit key and initialization vector (`iv`).
+/// Encrypt a media sample with AES-128-CTR. `iv` is the initial counter block.
 pub fn cenc_encrypt_sample(key: &[u8; 16], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(plaintext.len());
-    for (idx, &b) in plaintext.iter().enumerate() {
-        let k = key[idx & 15];
-        let v = iv[(idx.wrapping_add(idx >> 4)) & 15];
-        let mask = k.wrapping_add(v).wrapping_add((idx as u8).wrapping_mul(17));
-        out.push(b.wrapping_add(mask));
-    }
-    out
+    aes128_ctr(key, iv, plaintext)
 }
 
-/// Decrypt a media sample payload protected under ISO/IEC 23001-7 `cenc` 128-bit key and initialization vector (`iv`).
+/// Decrypt a media sample with AES-128-CTR. `iv` is the initial counter block.
 pub fn cenc_decrypt_sample(key: &[u8; 16], iv: &[u8; 16], ciphertext: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(ciphertext.len());
-    for (idx, &b) in ciphertext.iter().enumerate() {
-        let k = key[idx & 15];
-        let v = iv[(idx.wrapping_add(idx >> 4)) & 15];
-        let mask = k.wrapping_add(v).wrapping_add((idx as u8).wrapping_mul(17));
-        out.push(b.wrapping_sub(mask));
-    }
-    out
+    aes128_ctr(key, iv, ciphertext)
 }
 
 /// Wrap an encoded video bitstream inside a standard ISO Base Media File Format (`ISOBMFF` / `.mp4`) container
