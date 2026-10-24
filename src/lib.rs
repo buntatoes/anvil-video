@@ -24,9 +24,9 @@
 //! subsample ranges.
 //!
 //! Three sibling crates are called, and only for these calls:
-//! - `root-compress`: `compress_zlib` on encode, `decompress_zlib_bounded` on decode.
-//! - `root-cipher`: `aes128_ctr` from both sample functions above.
-//! - `root-gpu`: `Nv12Surface::from_rgba_bt709` and `Nv12Surface::to_rgba_bt709`,
+//! - `anvil-compress`: `compress_zlib` on encode, `decompress_zlib_bounded` on decode.
+//! - `anvil-cipher`: `aes128_ctr` from both sample functions above.
+//! - `anvil-gpu`: `Nv12Surface::from_rgba_bt709` and `Nv12Surface::to_rgba_bt709`,
 //!   which convert color in memory on the CPU.
 //!
 //! Not implemented: a hardware decoder, a GPU decode or encode session, H.264, AV1,
@@ -41,9 +41,9 @@
 
 use std::fmt;
 
-use root_cipher::aes128_ctr;
-use root_compress::{CompressError, compress_zlib, decompress_zlib_bounded};
-use root_gpu::Nv12Surface;
+use anvil_cipher::aes128_ctr;
+use anvil_compress::{CompressError, compress_zlib, decompress_zlib_bounded};
+use anvil_gpu::Nv12Surface;
 
 /// Largest accepted frame width, in pixels.
 pub const MAX_VIDEO_WIDTH: u32 = 4096;
@@ -118,7 +118,7 @@ pub enum VideoError {
     CorruptedBitstream,
     /// The 16-byte key id is not in the in-memory demo key list.
     MissingDecryptionKey { kid: [u8; 16] },
-    /// `root-compress` rejected the zlib packet.
+    /// `anvil-compress` rejected the zlib packet.
     Compression(CompressError),
 }
 
@@ -224,7 +224,7 @@ pub enum VideoCodecProfile {
     /// Label whose [`Self::fourcc`] is `av01`. Not an AV1 decoder.
     Av1Main,
     /// Label for the `FVID` bitstream this crate reads and writes. [`Self::fourcc`] is `fvid`.
-    RootNv12Temporal,
+    AnvilNv12Temporal,
 }
 
 impl VideoCodecProfile {
@@ -235,7 +235,7 @@ impl VideoCodecProfile {
         match self {
             VideoCodecProfile::H264High => *b"avc1",
             VideoCodecProfile::Av1Main => *b"av01",
-            VideoCodecProfile::RootNv12Temporal => *b"fvid",
+            VideoCodecProfile::AnvilNv12Temporal => *b"fvid",
         }
     }
 }
@@ -369,7 +369,7 @@ pub struct VideoClip {
     /// Backend label stored by the decoder. Not a device handle.
     pub backend: GpuVideoBackend,
     /// Profile stored by the decoder. [`GpuVideoSession::decode_fvid`] writes
-    /// [`VideoCodecProfile::RootNv12Temporal`].
+    /// [`VideoCodecProfile::AnvilNv12Temporal`].
     pub profile: VideoCodecProfile,
     /// Frames in bitstream order.
     pub frames: Vec<VideoFrame>,
@@ -457,9 +457,9 @@ pub enum EmeKeySystem {
     /// Label `org.w3.clearkey`. [`CdmSession::with_default_demo_key`] uses this.
     /// No key-system handshake is run.
     W3cClearKey,
-    /// Label `org.root.mediafoundation.cdm`. No operating-system media API is called.
+    /// Label `org.anvil.mediafoundation.cdm`. No operating-system media API is called.
     OsMediaFoundationDrm,
-    /// Label `org.root.external.cdm`. No plugin file is opened.
+    /// Label `org.anvil.external.cdm`. No plugin file is opened.
     ExternalPluginCdm,
 }
 
@@ -468,8 +468,8 @@ impl EmeKeySystem {
     pub fn identifier(self) -> &'static str {
         match self {
             EmeKeySystem::W3cClearKey => "org.w3.clearkey",
-            EmeKeySystem::OsMediaFoundationDrm => "org.root.mediafoundation.cdm",
-            EmeKeySystem::ExternalPluginCdm => "org.root.external.cdm",
+            EmeKeySystem::OsMediaFoundationDrm => "org.anvil.mediafoundation.cdm",
+            EmeKeySystem::ExternalPluginCdm => "org.anvil.external.cdm",
         }
     }
 
@@ -595,7 +595,7 @@ impl CdmSession {
 /// The name says GPU. What it stores is a [`GpuVideoBackend`] label, two boolean flags,
 /// a count of frames passed through encode, a count of frames passed through decode,
 /// and a [`CdmSession`] that starts with the fixed demo key. Encode and decode convert
-/// NV12 in memory with `root-gpu` and compress with `root-compress`. They do not open
+/// NV12 in memory with `anvil-gpu` and compress with `anvil-compress`. They do not open
 /// a device, and the flags do not change the plane math. Either flag updates the stored
 /// backend label when the session is created or when [`GpuVideoSession::set_hardware_acceleration`]
 /// runs. The encode flag also writes the `FVID` flag byte. The decode flag is what
@@ -703,7 +703,7 @@ impl GpuVideoSession {
     /// index is a multiple of 8. An `I` packet, or a packet with no previous planes, is the
     /// Y plane followed by the UV plane from `Nv12Surface::from_rgba_bt709`. Any other frame
     /// is `P`: each plane byte minus the previous plane byte with `wrapping_sub`. There is
-    /// no motion search. `compress_zlib` from `root-compress` wraps that buffer. The record
+    /// no motion search. `compress_zlib` from `anvil-compress` wraps that buffer. The record
     /// is the type byte, `pts_ms`, the compressed length, and the compressed bytes.
     /// Every frame must match the first frame's dimensions. An empty slice is
     /// [`VideoError::InvalidHeader`]. `frames_encoded` grows by one per written frame.
@@ -787,7 +787,7 @@ impl GpuVideoSession {
     /// residual byte with `wrapping_add`. The first frame must be `I`. Packet bytes
     /// are inflated with `decompress_zlib_bounded`, capped at the plane size, then
     /// turned back into RGBA with [`VideoFrame::from_nv12_surface`]. The clip profile
-    /// is [`VideoCodecProfile::RootNv12Temporal`]. `backend` is
+    /// is [`VideoCodecProfile::AnvilNv12Temporal`]. `backend` is
     /// [`probe_platform_gpu_backend`] of the stored decode flag, not a device result.
     /// `frames_decoded` grows by one per emitted frame.
     pub fn decode_fvid(&mut self, data: &[u8]) -> Result<VideoClip, VideoError> {
@@ -878,7 +878,7 @@ impl GpuVideoSession {
             height,
             fps,
             backend: active_backend,
-            profile: VideoCodecProfile::RootNv12Temporal,
+            profile: VideoCodecProfile::AnvilNv12Temporal,
             frames,
         })
     }
