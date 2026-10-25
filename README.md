@@ -46,7 +46,7 @@ Rust 2024. Dependencies are the three path crates above. No crates.io dependenci
 
 ## The other repositories
 
-The browser is [anvil-browser](https://github.com/buntatoes/anvil-browser). These libraries sit next to it. None of them come from crates.io.
+The browser is [anvil-browser](https://github.com/buntatoes/anvil-browser). The page engine is `anvil-engine` (proprietary, not MPL-2.0). These libraries sit next to both. None of them come from crates.io.
 
 | Repository | What it is |
 | --- | --- |

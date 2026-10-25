@@ -1,8 +1,9 @@
 # CPU frames in a small MP4 container. Frame packets use anvil-compress (zlib).
 # Plane conversion and present go through anvil-gpu's tile device when the
 # hardware flag is set. The AVID bytes are still zlib packets. No H.264 device.
-# Caller: anvil-browser. anvil-dom only records the video URL and does not
-# link this crate. anvil-raster does not link this crate either.
+# Caller: anvil-browser. anvil-dom (in anvil-engine) only records the video
+# URL and does not link this crate. anvil-raster (also in anvil-engine) does not
+# link this crate either.
 
 [package]
 name = "anvil-video"
