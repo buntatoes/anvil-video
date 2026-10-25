@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (c) 2026 Buntato
 //! CPU RGBA frames in a small ISOBMFF container, with optional AES-128-CTR on the sample.
 //!
 //! `wrap_mp4_container` writes three top-level boxes: `ftyp`, `moov`, and `mdat`.
