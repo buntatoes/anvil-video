@@ -21,7 +21,7 @@ It needs these directories next to this one:
 ## What it does
 
 - Frames are RGBA on the CPU. `generate_demo_mp4` builds a short clip. `GpuVideoSession` encodes and decodes that clip.
-- The container is an ISOBMFF / MP4 shell (`ftyp`, `moov`, `mdat`). `wrap_mp4_container`, `wrap_av_mp4_container`, `inspect_mp4_metadata`, and `parse_mp4_container` read and write single-track (`AVID`) and dual-track (`AAVM`: `AVID` video + `AAUD` 16-bit PCM / 4-bit IMA-ADPCM audio) containers, with `AudioOutputBridge` (`winmm` `WaveOut` on Windows / `ALSA` PCM probe on Linux) and RIFF `WAVE` (`encode_pcm16_wav`) output.
+- The container is a small MP4 shell (`ftyp`, `moov`, `mdat`). `wrap_mp4_container`, `wrap_av_mp4_container`, `inspect_mp4_metadata`, and `parse_mp4_container` read and write video-only (`AVID`) and video+audio (`AAVM`, with 16-bit PCM or 4-bit IMA-ADPCM `AAUD` audio) files. `encode_pcm16_wav` writes a `.wav` buffer, and `AudioOutputBridge` tracks audio levels and can hand that buffer to `winmm.dll` on Windows.
 - `cenc_encrypt_sample` and `cenc_decrypt_sample` are AES-128-CTR from `anvil-cipher`. The IV is the initial 16-byte counter.
 - `CdmSession` holds keys in memory for the demo clip. It is not a CDM and it does not talk to a license server.
 - Frame bytes are compressed with `anvil-compress`. When the hardware flag is on, color conversion and present go through `anvil-gpu`. The `AVID` packets are still zlib. This is not an H.264 or AV1 decoder. The browser draws the decoded frame through `composite_rgba_frame` before it paints the controls.
