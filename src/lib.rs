@@ -14,13 +14,13 @@
 //! A [`VideoFrame`] is packed `RGBA8888` (4 bytes per pixel). Encode calls
 //! `Nv12Surface::from_rgba_bt709` and stores a Y plane plus an interleaved UV plane,
 //! or a wrapping byte residual of those planes against the previous frame.
-//! `compress_zlib` then wraps that payload. Those packets form an `FVID` bitstream,
+//! `compress_zlib` then wraps that payload. Those packets form an `AVID` bitstream,
 //! and that bitstream is the `mdat` body. Decode calls `decompress_zlib_bounded`
 //! and `Nv12Surface::to_rgba_bt709`.
 //!
 //! Sample encryption uses a 16-byte AES-128 key and a 16-byte IV, which is the
 //! initial CTR counter. [`cenc_encrypt_sample`] and [`cenc_decrypt_sample`] both
-//! call `aes128_ctr`. The whole `FVID` buffer is one sample. There are no per-frame
+//! call `aes128_ctr`. The whole `AVID` buffer is one sample. There are no per-frame
 //! subsample ranges.
 //!
 //! Three sibling crates are called, and only for these calls:
@@ -55,7 +55,7 @@ pub const MAX_VIDEO_HEIGHT: u32 = 2160;
 /// Largest accepted pixel count for one frame (`4096 * 2160`).
 pub const MAX_VIDEO_PIXELS: u64 = 8_847_360;
 
-/// Largest accepted frame count in one `FVID` bitstream.
+/// Largest accepted frame count in one `AVID` bitstream.
 pub const MAX_VIDEO_FRAMES: u32 = 36_000;
 
 /// Largest zlib packet, and the largest `mdat` payload, in bytes (16 MiB).
@@ -83,7 +83,7 @@ pub const W3C_CLEARKEY_SYSTEM_ID: [u8; 16] = [
 /// Fixed array in this file. Not a secret fetched from disk.
 // Fixed demo constant. Not a secret fetched from disk.
 pub const DEFAULT_EME_DEMO_KID: [u8; 16] = [
-    0x46, 0x4c, 0x55, 0x58, 0x5f, 0x43, 0x45, 0x4e, 0x43, 0x5f, 0x4b, 0x49, 0x44, 0x5f, 0x30, 0x31,
+    0x41, 0x4e, 0x56, 0x4c, 0x5f, 0x43, 0x45, 0x4e, 0x43, 0x5f, 0x4b, 0x49, 0x44, 0x5f, 0x30, 0x31,
 ];
 
 /// 16-byte demo AES-128 key used by the encrypted demo.
@@ -96,7 +96,7 @@ pub const DEFAULT_EME_DEMO_KEY: [u8; 16] = [
     0x9a, 0x7b, 0x3c, 0x5d, 0x1e, 0x8f, 0x20, 0x41, 0x62, 0x83, 0xa4, 0xc5, 0xe6, 0x07, 0x18, 0x29,
 ];
 
-/// Failure from a limit check, a box walk, an `FVID` parse, or zlib.
+/// Failure from a limit check, a box walk, an `AVID` parse, or zlib.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VideoError {
     /// Magic, version, empty input, pixel length, or a required box was wrong or missing.
@@ -224,19 +224,19 @@ pub enum VideoCodecProfile {
     H264High,
     /// Label whose [`Self::fourcc`] is `av01`. Not an AV1 decoder.
     Av1Main,
-    /// Label for the `FVID` bitstream this crate reads and writes. [`Self::fourcc`] is `fvid`.
+    /// Label for the `AVID` bitstream this crate reads and writes. [`Self::fourcc`] is `avid`.
     AnvilNv12Temporal,
 }
 
 impl VideoCodecProfile {
-    /// `avc1`, `av01`, or `fvid`. The muxer does not write this code into a sample entry.
+    /// `avc1`, `av01`, or `avid`. The muxer does not write this code into a sample entry.
     ///
-    /// The bitstream magic is the separate four bytes `FVID`.
+    /// The bitstream magic is the separate four bytes `AVID`.
     pub fn fourcc(self) -> [u8; 4] {
         match self {
             VideoCodecProfile::H264High => *b"avc1",
             VideoCodecProfile::Av1Main => *b"av01",
-            VideoCodecProfile::AnvilNv12Temporal => *b"fvid",
+            VideoCodecProfile::AnvilNv12Temporal => *b"avid",
         }
     }
 }
@@ -356,20 +356,20 @@ impl VideoFrame {
     }
 }
 
-/// Frames decoded from one `FVID` bitstream, plus the header fields copied next to them.
+/// Frames decoded from one `AVID` bitstream, plus the header fields copied next to them.
 ///
 /// `backend` is a label from [`probe_platform_gpu_backend`], not a measurement from a device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoClip {
-    /// Width copied from the `FVID` header.
+    /// Width copied from the `AVID` header.
     pub width: u32,
-    /// Height copied from the `FVID` header.
+    /// Height copied from the `AVID` header.
     pub height: u32,
-    /// Frames per second copied from the `FVID` header, at least 1.
+    /// Frames per second copied from the `AVID` header, at least 1.
     pub fps: u32,
     /// Backend label stored by the decoder. Not a device handle.
     pub backend: GpuVideoBackend,
-    /// Profile stored by the decoder. [`GpuVideoSession::decode_fvid`] writes
+    /// Profile stored by the decoder. [`GpuVideoSession::decode_avid`] writes
     /// [`VideoCodecProfile::AnvilNv12Temporal`].
     pub profile: VideoCodecProfile,
     /// Frames in bitstream order.
@@ -391,7 +391,7 @@ impl VideoClip {
 
     /// How many frames have [`VideoFrame::keyframe`] set.
     ///
-    /// After [`GpuVideoSession::decode_fvid`], that flag is set on `I` packets only.
+    /// After [`GpuVideoSession::decode_avid`], that flag is set on `I` packets only.
     pub fn keyframe_count(&self) -> usize {
         self.frames.iter().filter(|f| f.keyframe).count()
     }
@@ -591,7 +591,7 @@ impl CdmSession {
     }
 }
 
-/// CPU encode and decode state for `FVID` and for the small MP4 wrapper around it.
+/// CPU encode and decode state for `AVID` and for the small MP4 wrapper around it.
 ///
 /// The name says GPU. What it stores is a [`GpuVideoBackend`] label, two boolean flags,
 /// a count of frames passed through encode, a count of frames passed through decode,
@@ -599,19 +599,19 @@ impl CdmSession {
 /// NV12 in memory with `anvil-gpu` and compress with `anvil-compress`. They do not open
 /// a device, and the flags do not change the plane math. Either flag updates the stored
 /// backend label when the session is created or when [`GpuVideoSession::set_hardware_acceleration`]
-/// runs. The encode flag also writes the `FVID` flag byte. The decode flag is what
-/// [`GpuVideoSession::decode_fvid`] passes to [`probe_platform_gpu_backend`] for the clip.
+/// runs. The encode flag also writes the `AVID` flag byte. The decode flag is what
+/// [`GpuVideoSession::decode_avid`] passes to [`probe_platform_gpu_backend`] for the clip.
 #[derive(Clone, Debug)]
 pub struct GpuVideoSession {
     /// Label from [`probe_platform_gpu_backend`]. Not a device handle.
     backend: GpuVideoBackend,
     /// Stored flag. Decode still runs on the CPU.
     hardware_decode_enabled: bool,
-    /// Stored flag. Encode still runs on the CPU. Also selects the `FVID` flag byte.
+    /// Stored flag. Encode still runs on the CPU. Also selects the `AVID` flag byte.
     hardware_encode_enabled: bool,
-    /// Frames emitted by [`Self::decode_fvid`].
+    /// Frames emitted by [`Self::decode_avid`].
     frames_decoded: u64,
-    /// Frames accepted by [`Self::encode_fvid`].
+    /// Frames accepted by [`Self::encode_avid`].
     frames_encoded: u64,
     /// Demo key list. Starts as [`CdmSession::with_default_demo_key`].
     cdm_session: CdmSession,
@@ -676,7 +676,7 @@ impl GpuVideoSession {
         self.backend = probe_platform_gpu_backend(decode || encode);
     }
 
-    /// Frames emitted by [`Self::decode_fvid`] on this session.
+    /// Frames emitted by [`Self::decode_avid`] on this session.
     ///
     /// The count advances as each frame is pushed. A later error in that call does not
     /// subtract frames already counted.
@@ -684,7 +684,7 @@ impl GpuVideoSession {
         self.frames_decoded
     }
 
-    /// Frames appended by [`Self::encode_fvid`] on this session.
+    /// Frames appended by [`Self::encode_avid`] on this session.
     ///
     /// The count advances as each frame is written. A later error in that call does not
     /// subtract frames already counted.
@@ -692,9 +692,9 @@ impl GpuVideoSession {
         self.frames_encoded
     }
 
-    /// Write an `FVID` bitstream for `frames`.
+    /// Write an `AVID` bitstream for `frames`.
     ///
-    /// The header is big-endian: magic `FVID`, version `u16` 1, one flag byte, one zero
+    /// The header is big-endian: magic `AVID`, version `u16` 1, one flag byte, one zero
     /// byte, width, height, `fps` (stored as at least 1), and the frame count. The flag
     /// byte is 1 only when the encode flag is set and [`GpuVideoBackend::is_hardware_accelerated`]
     /// is true for the stored label. Decode does not read that byte. Planes are still built
@@ -708,7 +708,7 @@ impl GpuVideoSession {
     /// is the type byte, `pts_ms`, the compressed length, and the compressed bytes.
     /// Every frame must match the first frame's dimensions. An empty slice is
     /// [`VideoError::InvalidHeader`]. `frames_encoded` grows by one per written frame.
-    pub fn encode_fvid(&mut self, fps: u32, frames: &[VideoFrame]) -> Result<Vec<u8>, VideoError> {
+    pub fn encode_avid(&mut self, fps: u32, frames: &[VideoFrame]) -> Result<Vec<u8>, VideoError> {
         if frames.is_empty() {
             return Err(VideoError::InvalidHeader);
         }
@@ -723,7 +723,7 @@ impl GpuVideoSession {
         validate_video_dimensions(width, height)?;
 
         let mut out = Vec::new();
-        out.extend_from_slice(b"FVID");
+        out.extend_from_slice(b"AVID");
         out.extend_from_slice(&1u16.to_be_bytes()); // version 1
         let hw_flag = if self.hardware_encode_enabled && self.backend.is_hardware_accelerated() {
             1u8
@@ -786,9 +786,9 @@ impl GpuVideoSession {
         Ok(out)
     }
 
-    /// Read an `FVID` bitstream into a [`VideoClip`].
+    /// Read an `AVID` bitstream into a [`VideoClip`].
     ///
-    /// Requires magic `FVID` and version 1. The flag byte at offset 6 is not read.
+    /// Requires magic `AVID` and version 1. The flag byte at offset 6 is not read.
     /// An `I` packet replaces the reference Y and UV planes. A `P` packet adds each
     /// residual byte with `wrapping_add`. The first frame must be `I`. Packet bytes
     /// are inflated with `decompress_zlib_bounded`, capped at the plane size, then
@@ -796,9 +796,9 @@ impl GpuVideoSession {
     /// is [`VideoCodecProfile::AnvilNv12Temporal`]. `backend` is
     /// [`probe_platform_gpu_backend`] of the stored decode flag, not a device result.
     /// `frames_decoded` grows by one per emitted frame.
-    pub fn decode_fvid(&mut self, data: &[u8]) -> Result<VideoClip, VideoError> {
+    pub fn decode_avid(&mut self, data: &[u8]) -> Result<VideoClip, VideoError> {
         // Magic through frame count is 24 bytes. Offset 6 (flag) and 7 (reserved) are unread.
-        if data.len() < 24 || &data[0..4] != b"FVID" {
+        if data.len() < 24 || &data[0..4] != b"AVID" {
             return Err(VideoError::InvalidHeader);
         }
         let version = u16::from_be_bytes([data[4], data[5]]);
@@ -875,7 +875,13 @@ impl GpuVideoSession {
 
             let decoded_frame = if self.hardware_decode_enabled {
                 let rgba = present_nv12_on_device(&ref_surface);
-                VideoFrame::new(ref_surface.width, ref_surface.height, pts_ms, is_keyframe, rgba)?
+                VideoFrame::new(
+                    ref_surface.width,
+                    ref_surface.height,
+                    pts_ms,
+                    is_keyframe,
+                    rgba,
+                )?
             } else {
                 VideoFrame::from_nv12_surface(&ref_surface, pts_ms, is_keyframe)?
             };
@@ -894,19 +900,19 @@ impl GpuVideoSession {
         })
     }
 
-    /// Encode `frames` as `FVID`, then wrap that bitstream with [`wrap_mp4_container`].
+    /// Encode `frames` as `AVID`, then wrap that bitstream with [`wrap_mp4_container`].
     ///
     /// Duration written into `mvhd` is the last frame's `pts_ms`, or 0 when that is missing.
-    /// [`Self::encode_fvid`] already rejects an empty list, so the first frame exists here.
+    /// [`Self::encode_avid`] already rejects an empty list, so the first frame exists here.
     pub fn encode_mp4(&mut self, fps: u32, frames: &[VideoFrame]) -> Result<Vec<u8>, VideoError> {
-        let fvid_stream = self.encode_fvid(fps, frames)?;
+        let avid_stream = self.encode_avid(fps, frames)?;
         let width = frames[0].width;
         let height = frames[0].height;
         let duration_ms = frames.last().map(|f| f.pts_ms).unwrap_or(0);
-        Ok(wrap_mp4_container(width, height, duration_ms, &fvid_stream))
+        Ok(wrap_mp4_container(width, height, duration_ms, &avid_stream))
     }
 
-    /// Encode `frames` as `FVID`, then wrap that bitstream as one AES-128-CTR sample.
+    /// Encode `frames` as `AVID`, then wrap that bitstream as one AES-128-CTR sample.
     ///
     /// `key` is 16 bytes. `iv` is the 16-byte initial counter. `key_id` is the 16-byte id
     /// written into `tenc` and `pssh`. Encrypt goes through [`wrap_encrypted_mp4_container`],
@@ -920,7 +926,7 @@ impl GpuVideoSession {
         key: [u8; 16],
         iv: [u8; 16],
     ) -> Result<Vec<u8>, VideoError> {
-        let fvid_stream = self.encode_fvid(fps, frames)?;
+        let avid_stream = self.encode_avid(fps, frames)?;
         let width = frames[0].width;
         let height = frames[0].height;
         let duration_ms = frames.last().map(|f| f.pts_ms).unwrap_or(0);
@@ -931,11 +937,11 @@ impl GpuVideoSession {
             key_id,
             key,
             iv,
-            &fvid_stream,
+            &avid_stream,
         ))
     }
 
-    /// Decode a buffer that is either an MP4 starting with `ftyp` or a raw `FVID` bitstream.
+    /// Decode a buffer that is either an MP4 starting with `ftyp` or a raw `AVID` bitstream.
     ///
     /// For `ftyp`, metadata is read and the top-level `mdat` payload is taken. When `tenc`
     /// says the sample is protected, the 16-byte key id (or [`DEFAULT_EME_DEMO_KID`] when
@@ -943,8 +949,8 @@ impl GpuVideoSession {
     /// value, or 16 zero bytes. [`cenc_decrypt_sample`] runs `aes128_ctr` on the whole
     /// payload. One successful call increments the decrypt counter by one. A missing key
     /// returns [`VideoError::MissingDecryptionKey`] and does not decode. A wrong key is
-    /// not reported here. The following `FVID` parse fails if the plaintext is not valid.
-    /// Anything that is not an `ftyp` buffer is passed straight to [`Self::decode_fvid`].
+    /// not reported here. The following `AVID` parse fails if the plaintext is not valid.
+    /// Anything that is not an `ftyp` buffer is passed straight to [`Self::decode_avid`].
     pub fn decode_video_auto(&mut self, data: &[u8]) -> Result<VideoClip, VideoError> {
         if data.len() >= 8 && &data[4..8] == b"ftyp" {
             let meta = inspect_mp4_metadata(data)?;
@@ -959,11 +965,11 @@ impl GpuVideoSession {
                 let decrypted = cenc_decrypt_sample(&key, &iv, payload);
                 self.cdm_session.decrypted_samples =
                     self.cdm_session.decrypted_samples.saturating_add(1);
-                return self.decode_fvid(&decrypted);
+                return self.decode_avid(&decrypted);
             }
-            return self.decode_fvid(payload);
+            return self.decode_avid(payload);
         }
-        self.decode_fvid(data)
+        self.decode_avid(data)
     }
 }
 
@@ -1461,7 +1467,7 @@ mod tests {
 
     #[test]
     fn muxes_and_demuxes_isobmff_mp4_video_container() {
-        let mp4 = wrap_mp4_container(64, 48, 1000, b"FVID_TEST_STREAM");
+        let mp4 = wrap_mp4_container(64, 48, 1000, b"AVID_TEST_STREAM");
         assert_eq!(&mp4[4..8], b"ftyp");
         let meta = inspect_mp4_metadata(&mp4).unwrap();
         assert_eq!(meta.brand, *b"isom");
@@ -1469,7 +1475,7 @@ mod tests {
         assert_eq!(meta.height, 48);
         assert_eq!(meta.duration_ms, 1000);
         let extracted = parse_mp4_container(&mp4).unwrap();
-        assert_eq!(extracted, b"FVID_TEST_STREAM");
+        assert_eq!(extracted, b"AVID_TEST_STREAM");
     }
 
     #[test]
@@ -1492,7 +1498,7 @@ mod tests {
         let mut bad_mp4 = Vec::new();
         write_mp4_box(&mut bad_mp4, *b"ftyp", b"isom\x00\x00\x02\x00isommp42");
         write_mp4_box(&mut bad_mp4, *b"moov", &nested);
-        write_mp4_box(&mut bad_mp4, *b"mdat", b"FVID");
+        write_mp4_box(&mut bad_mp4, *b"mdat", b"AVID");
         assert!(matches!(
             inspect_mp4_metadata(&bad_mp4),
             Err(VideoError::BoxDepthExceeded { .. })
@@ -1532,8 +1538,8 @@ mod tests {
         let rgba = vec![10u8, 180, 40, 255].repeat(8);
         let frame = VideoFrame::new(4, 2, 0, true, rgba.clone()).unwrap();
         let mut session = GpuVideoSession::new(true, true);
-        let bytes = session.encode_fvid(30, &[frame]).unwrap();
-        let clip = session.decode_fvid(&bytes).unwrap();
+        let bytes = session.encode_avid(30, &[frame]).unwrap();
+        let clip = session.decode_avid(&bytes).unwrap();
         assert_eq!(clip.frames.len(), 1);
         assert!(anvil_gpu::device_converts() > converts);
         assert!(anvil_gpu::device_presents() > presents);

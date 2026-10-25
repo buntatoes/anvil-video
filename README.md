@@ -24,7 +24,7 @@ It needs these directories next to this one:
 - The container is an ISOBMFF / MP4 shell (`ftyp`, `moov`, `mdat`). `wrap_mp4_container`, `inspect_mp4_metadata`, and `parse_mp4_container` read and write it.
 - `cenc_encrypt_sample` and `cenc_decrypt_sample` are AES-128-CTR from `anvil-cipher`. The IV is the initial 16-byte counter.
 - `CdmSession` holds keys in memory for the demo clip. It is not a CDM and it does not talk to a license server.
-- Frame bytes are compressed with `anvil-compress`. When the hardware flag is on, color conversion and present go through `anvil-gpu`. The `FVID` packets are still zlib. This is not an H.264 or AV1 decoder. The browser draws the decoded frame through `composite_rgba_frame` before it paints the controls.
+- Frame bytes are compressed with `anvil-compress`. When the hardware flag is on, color conversion and present go through `anvil-gpu`. The `AVID` packets are still zlib. This is not an H.264 or AV1 decoder. The browser draws the decoded frame through `composite_rgba_frame` before it paints the controls.
 
 ## What it does not do
 
