@@ -339,6 +339,229 @@ impl AudioTrack {
     }
 }
 
+impl AudioTrack {
+    /// Extract the interleaved 16-bit PCM sample window for `[start_ms, start_ms + duration_ms)`.
+    pub fn slice_pcm_window(&self, start_ms: u32, duration_ms: u32) -> Vec<i16> {
+        if self.samples.is_empty() || self.sample_rate == 0 || self.channels == 0 {
+            return Vec::new();
+        }
+        let ch = self.channels as usize;
+        let sr = self.sample_rate as usize;
+        let start_frame = ((start_ms as usize) * sr) / 1000;
+        let span_frames = (((duration_ms.max(1) as usize) * sr) / 1000).max(1);
+        let start_idx = (start_frame * ch).min(self.samples.len());
+        let end_idx = ((start_frame + span_frames) * ch).min(self.samples.len());
+        if start_idx >= end_idx {
+            return Vec::new();
+        }
+        self.samples[start_idx..end_idx].to_vec()
+    }
+
+    /// Encode this track as a standard 44-byte header RIFF `WAVE` (`PCM16LE`) byte buffer.
+    pub fn to_wav_bytes(&self) -> Vec<u8> {
+        encode_pcm16_wav(self.sample_rate, self.channels, &self.samples)
+    }
+}
+
+/// Encode interleaved 16-bit signed PCM samples into a RIFF `WAVE` (`fmt ` + `data`) byte buffer.
+pub fn encode_pcm16_wav(sample_rate: u32, channels: u8, samples: &[i16]) -> Vec<u8> {
+    let ch = u16::from(channels.clamp(1, 2));
+    let sr = sample_rate.max(8_000);
+    let data_bytes = (samples.len() * 2) as u32;
+    let riff_size = 36u32.saturating_add(data_bytes);
+    let byte_rate = sr.saturating_mul(u32::from(ch)).saturating_mul(2);
+    let block_align = ch * 2;
+
+    let mut out = Vec::with_capacity(44 + samples.len() * 2);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&riff_size.to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM = 1
+    out.extend_from_slice(&ch.to_le_bytes());
+    out.extend_from_slice(&sr.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample = 16
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_bytes.to_le_bytes());
+    for &s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+/// Host operating-system audio output backend reported by [`AudioOutputBridge`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OsAudioBackend {
+    /// Windows Multimedia `winmm.dll` (`waveOutGetNumDevs` / `sndPlaySoundA` / `WaveOut`).
+    WinMmWaveOut,
+    /// Linux ALSA PCM (`libasound` / `/proc/asound`).
+    LinuxAlsaPcm,
+    /// Software PCM mixer sink when no hardware audio output device is present.
+    SoftwareMixerSink,
+}
+
+impl OsAudioBackend {
+    /// Human-readable label for diagnostics and the media HUD.
+    pub fn label(self) -> &'static str {
+        match self {
+            OsAudioBackend::WinMmWaveOut => "Windows WinMM WaveOut (PCM16)",
+            OsAudioBackend::LinuxAlsaPcm => "Linux ALSA PCM (PCM16)",
+            OsAudioBackend::SoftwareMixerSink => "Software PCM16 Mixer Sink",
+        }
+    }
+
+    /// `true` when backed by a host OS audio subsystem (`WinMmWaveOut` or `LinuxAlsaPcm`).
+    pub fn is_native_os_device(self) -> bool {
+        !matches!(self, OsAudioBackend::SoftwareMixerSink)
+    }
+}
+
+/// Probe the host operating system's native audio subsystem and return `(backend, device_count)`.
+pub fn probe_os_audio_backend() -> (OsAudioBackend, u32) {
+    #[cfg(target_os = "windows")]
+    {
+        use core::ffi::c_void;
+        type HModule = *mut c_void;
+        type FarProc = *const c_void;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn LoadLibraryA(lp_lib_file_name: *const u8) -> HModule;
+            fn GetProcAddress(h_module: HModule, lp_proc_name: *const u8) -> FarProc;
+        }
+        unsafe {
+            let winmm = LoadLibraryA(b"winmm.dll\0".as_ptr());
+            if !winmm.is_null() {
+                let proc_ptr = GetProcAddress(winmm, b"waveOutGetNumDevs\0".as_ptr());
+                if !proc_ptr.is_null() {
+                    type WaveOutGetNumDevsFn = unsafe extern "system" fn() -> u32;
+                    let get_num_devs: WaveOutGetNumDevsFn = core::mem::transmute(proc_ptr);
+                    let count = get_num_devs();
+                    return (OsAudioBackend::WinMmWaveOut, count);
+                }
+            }
+        }
+        (OsAudioBackend::WinMmWaveOut, 0)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let cards = std::fs::read_to_string("/proc/asound/cards").unwrap_or_default();
+        let count = cards.lines().filter(|l| l.contains('[')).count() as u32;
+        (OsAudioBackend::LinuxAlsaPcm, count)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        (OsAudioBackend::SoftwareMixerSink, 0)
+    }
+}
+
+/// Synchronized PCM audio output bridge for `<video>` playback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioOutputBridge {
+    /// Active OS audio backend.
+    pub backend: OsAudioBackend,
+    /// Number of hardware audio output devices reported by the OS probe.
+    pub hardware_devices_detected: u32,
+    /// Whether audio output is muted.
+    pub muted: bool,
+    /// Playback volume percentage (`0..=100`).
+    pub volume_percent: u8,
+    /// Total audio windows submitted across playback steps.
+    pub submitted_windows: u64,
+    /// Total interleaved PCM samples mixed and submitted.
+    pub submitted_samples: u64,
+    /// Peak amplitude (`0..=100`) of the most recently submitted window.
+    pub last_peak_level: u8,
+}
+
+impl Default for AudioOutputBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AudioOutputBridge {
+    /// Probe the host audio subsystem and initialize an unmuted bridge at 100% volume.
+    pub fn new() -> Self {
+        let (backend, hardware_devices_detected) = probe_os_audio_backend();
+        Self {
+            backend,
+            hardware_devices_detected,
+            muted: false,
+            volume_percent: 100,
+            submitted_windows: 0,
+            submitted_samples: 0,
+            last_peak_level: 0,
+        }
+    }
+
+    /// Slice `[pts_ms, pts_ms + window_ms)` from `track`, apply volume/mute scaling,
+    /// update telemetry counters, and optionally dispatch an asynchronous in-memory RIFF WAVE
+    /// buffer to `winmm.dll` (`sndPlaySoundA`) on Windows when `emit_to_os_device` is true.
+    pub fn submit_track_window(
+        &mut self,
+        track: &AudioTrack,
+        pts_ms: u32,
+        window_ms: u32,
+        emit_to_os_device: bool,
+    ) -> usize {
+        let mut pcm = track.slice_pcm_window(pts_ms, window_ms);
+        if pcm.is_empty() {
+            self.last_peak_level = 0;
+            return 0;
+        }
+        let scale = if self.muted {
+            0i32
+        } else {
+            i32::from(self.volume_percent.min(100))
+        };
+        let mut peak = 0i32;
+        for sample in &mut pcm {
+            let scaled = ((i32::from(*sample) * scale) / 100).clamp(-32768, 32767);
+            *sample = scaled as i16;
+            let amp = scaled.abs();
+            if amp > peak {
+                peak = amp;
+            }
+        }
+        self.last_peak_level = ((peak * 100) / 32767).clamp(0, 100) as u8;
+        self.submitted_windows = self.submitted_windows.saturating_add(1);
+        self.submitted_samples = self.submitted_samples.saturating_add(pcm.len() as u64);
+
+        #[cfg(target_os = "windows")]
+        if emit_to_os_device && !self.muted && self.hardware_devices_detected > 0 {
+            use core::ffi::c_void;
+            type HModule = *mut c_void;
+            type FarProc = *const c_void;
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn LoadLibraryA(lp_lib_file_name: *const u8) -> HModule;
+                fn GetProcAddress(h_module: HModule, lp_proc_name: *const u8) -> FarProc;
+            }
+            const SND_ASYNC: u32 = 0x0001;
+            const SND_NODEFAULT: u32 = 0x0002;
+            const SND_MEMORY: u32 = 0x0004;
+            let wav = encode_pcm16_wav(track.sample_rate, track.channels, &pcm);
+            unsafe {
+                let winmm = LoadLibraryA(b"winmm.dll\0".as_ptr());
+                if !winmm.is_null() {
+                    let proc_ptr = GetProcAddress(winmm, b"sndPlaySoundA\0".as_ptr());
+                    if !proc_ptr.is_null() {
+                        type SndPlaySoundAFn =
+                            unsafe extern "system" fn(lpsz_sound: *const u8, fu_sound: u32) -> i32;
+                        let play_fn: SndPlaySoundAFn = core::mem::transmute(proc_ptr);
+                        let _ = play_fn(wav.as_ptr(), SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+                    }
+                }
+            }
+        }
+        let _ = emit_to_os_device;
+        pcm.len()
+    }
+}
+
 fn ima_adpcm_encode_step(sample: i16, predictor: &mut i32, step_index: &mut i32) -> u8 {
     let step = IMA_STEP_TABLE[*step_index as usize];
     let mut diff = (sample as i32) - *predictor;
@@ -2003,5 +2226,18 @@ mod tests {
         let clip = session.decode_video_auto(&demo_mp4).unwrap();
         assert!(clip.audio.is_some());
         assert!(clip.peak_audio_level_at_ms(33) > 10);
+
+        let window = pcm_track.slice_pcm_window(0, 50);
+        assert!(!window.is_empty());
+        let wav = pcm_track.to_wav_bytes();
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        let (backend, _) = probe_os_audio_backend();
+        let mut bridge = AudioOutputBridge::new();
+        assert_eq!(bridge.backend, backend);
+        let bridge_wav = bridge.submit_track_window(&pcm_track, 0, 33, false);
+        assert!(bridge_wav > 0);
+        assert!(bridge.submitted_samples > 0);
+        assert!(bridge.last_peak_level > 10);
     }
 }
