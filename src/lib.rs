@@ -241,6 +241,277 @@ impl VideoCodecProfile {
     }
 }
 
+const IMA_INDEX_TABLE: [i32; 16] = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
+
+const IMA_STEP_TABLE: [i32; 89] = [
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66,
+    73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449,
+    494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272,
+    2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493,
+    10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
+];
+
+/// Audio codec profile used inside an `AAUD` stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioCodecProfile {
+    /// Uncompressed 16-bit signed little-endian PCM wrapped in zlib.
+    Pcm16Le,
+    /// 4-bit IMA-ADPCM adaptive differential pulse-code modulation wrapped in zlib.
+    ImaAdpcm4,
+}
+
+/// Decoded interleaved 16-bit signed PCM audio track synchronized with a [`VideoClip`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioTrack {
+    /// Sample rate in Hz (for example `44_100` or `48_000`).
+    pub sample_rate: u32,
+    /// Channel count (`1` for mono, `2` for stereo).
+    pub channels: u8,
+    /// Codec profile used when serializing to `AAUD`.
+    pub codec: AudioCodecProfile,
+    /// Interleaved 16-bit signed PCM samples (`L, R, L, R, ...` when stereo).
+    pub samples: Vec<i16>,
+}
+
+impl AudioTrack {
+    /// Total duration of this audio track in milliseconds.
+    pub fn duration_ms(&self) -> u32 {
+        let ch = (self.channels.max(1)) as u64;
+        let sr = (self.sample_rate.max(1)) as u64;
+        let frames = (self.samples.len() as u64) / ch;
+        ((frames * 1000) / sr) as u32
+    }
+
+    /// Compute normalized peak audio level (`0..=100`) around `pts_ms` over `window_ms`.
+    pub fn peak_level_at_ms(&self, pts_ms: u32, window_ms: u32) -> u8 {
+        if self.samples.is_empty() || self.sample_rate == 0 || self.channels == 0 {
+            return 0;
+        }
+        let ch = self.channels as usize;
+        let sr = self.sample_rate as usize;
+        let start_frame = ((pts_ms as usize) * sr) / 1000;
+        let span_frames = (((window_ms.max(10) as usize) * sr) / 1000).max(1);
+        let start_idx = (start_frame * ch).min(self.samples.len());
+        let end_idx = ((start_frame + span_frames) * ch).min(self.samples.len());
+        if start_idx >= end_idx {
+            return 0;
+        }
+        let mut peak = 0i32;
+        for &s in &self.samples[start_idx..end_idx] {
+            let amp = (s as i32).abs();
+            if amp > peak {
+                peak = amp;
+            }
+        }
+        ((peak * 100) / 32767).clamp(0, 100) as u8
+    }
+
+    /// Synthesize a harmonic stereo/mono chime track for demo MP4 streams and tests.
+    pub fn synthesize_harmonic_chime(
+        duration_ms: u32,
+        sample_rate: u32,
+        channels: u8,
+        codec: AudioCodecProfile,
+    ) -> Self {
+        let sr = sample_rate.clamp(8_000, 96_000);
+        let ch = channels.clamp(1, 2);
+        let total_frames = ((duration_ms as u64 * sr as u64) / 1000) as usize;
+        let mut samples = Vec::with_capacity(total_frames * ch as usize);
+        for i in 0..total_frames {
+            let t = (i as f32) / (sr as f32);
+            let env = (1.0 - (i as f32 / (total_frames.max(1) as f32)) * 0.55).clamp(0.15, 1.0);
+            let f1 = (t * 440.0 * core::f32::consts::TAU).sin();
+            let f2 = (t * 659.25 * core::f32::consts::TAU).sin() * 0.5;
+            let sample_l = ((f1 + f2) * 0.45 * env * 18_000.0).clamp(-32767.0, 32767.0) as i16;
+            samples.push(sample_l);
+            if ch == 2 {
+                let f3 = (t * 554.37 * core::f32::consts::TAU).sin() * 0.6;
+                let sample_r = ((f1 + f3) * 0.45 * env * 18_000.0).clamp(-32767.0, 32767.0) as i16;
+                samples.push(sample_r);
+            }
+        }
+        Self {
+            sample_rate: sr,
+            channels: ch,
+            codec,
+            samples,
+        }
+    }
+}
+
+fn ima_adpcm_encode_step(sample: i16, predictor: &mut i32, step_index: &mut i32) -> u8 {
+    let step = IMA_STEP_TABLE[*step_index as usize];
+    let mut diff = (sample as i32) - *predictor;
+    let mut nibble = 0u8;
+    if diff < 0 {
+        nibble = 8;
+        diff = -diff;
+    }
+    let mut vpdiff = step >> 3;
+    if diff >= step {
+        nibble |= 4;
+        diff -= step;
+        vpdiff += step;
+    }
+    if diff >= (step >> 1) {
+        nibble |= 2;
+        diff -= step >> 1;
+        vpdiff += step >> 1;
+    }
+    if diff >= (step >> 2) {
+        nibble |= 1;
+        vpdiff += step >> 2;
+    }
+    if (nibble & 8) != 0 {
+        *predictor -= vpdiff;
+    } else {
+        *predictor += vpdiff;
+    }
+    *predictor = (*predictor).clamp(-32768, 32767);
+    *step_index = (*step_index + IMA_INDEX_TABLE[nibble as usize]).clamp(0, 88);
+    nibble & 0x0F
+}
+
+fn ima_adpcm_decode_step(nibble: u8, predictor: &mut i32, step_index: &mut i32) -> i16 {
+    let step = IMA_STEP_TABLE[*step_index as usize];
+    let mut vpdiff = step >> 3;
+    if (nibble & 4) != 0 {
+        vpdiff += step;
+    }
+    if (nibble & 2) != 0 {
+        vpdiff += step >> 1;
+    }
+    if (nibble & 1) != 0 {
+        vpdiff += step >> 2;
+    }
+    if (nibble & 8) != 0 {
+        *predictor -= vpdiff;
+    } else {
+        *predictor += vpdiff;
+    }
+    *predictor = (*predictor).clamp(-32768, 32767);
+    *step_index = (*step_index + IMA_INDEX_TABLE[(nibble & 0x0F) as usize]).clamp(0, 88);
+    *predictor as i16
+}
+
+/// Encode an [`AudioTrack`] into a 16-byte `AAUD` header followed by zlib-compressed audio data.
+pub fn encode_aaud_bitstream(track: &AudioTrack) -> Result<Vec<u8>, VideoError> {
+    if track.channels == 0 || track.channels > 2 || track.sample_rate == 0 {
+        return Err(VideoError::InvalidHeader);
+    }
+    let sample_count = track.samples.len();
+    if sample_count > MAX_PACKET_BYTES / 2 {
+        return Err(VideoError::PacketTooLarge {
+            size: sample_count * 2,
+        });
+    }
+    let mut raw = Vec::new();
+    let codec_byte = match track.codec {
+        AudioCodecProfile::Pcm16Le => {
+            raw.reserve(sample_count * 2);
+            for &s in &track.samples {
+                raw.extend_from_slice(&s.to_le_bytes());
+            }
+            0u8
+        }
+        AudioCodecProfile::ImaAdpcm4 => {
+            raw.reserve((sample_count + 1) / 2);
+            let ch = track.channels as usize;
+            let mut pred = [0i32; 2];
+            let mut idx = [0i32; 2];
+            let mut packed_byte = 0u8;
+            for (i, &s) in track.samples.iter().enumerate() {
+                let c = i % ch;
+                let nib = ima_adpcm_encode_step(s, &mut pred[c], &mut idx[c]);
+                if (i & 1) == 0 {
+                    packed_byte = nib;
+                } else {
+                    packed_byte |= nib << 4;
+                    raw.push(packed_byte);
+                }
+            }
+            if (sample_count & 1) != 0 {
+                raw.push(packed_byte);
+            }
+            1u8
+        }
+    };
+    let compressed = compress_zlib(&raw);
+    if compressed.len() > MAX_PACKET_BYTES {
+        return Err(VideoError::PacketTooLarge {
+            size: compressed.len(),
+        });
+    }
+    let mut out = Vec::with_capacity(16 + compressed.len());
+    out.extend_from_slice(b"AAUD");
+    out.push(1u8);
+    out.push(codec_byte);
+    out.push(track.channels);
+    out.push(0u8);
+    out.extend_from_slice(&track.sample_rate.to_be_bytes());
+    out.extend_from_slice(&(sample_count as u32).to_be_bytes());
+    out.extend_from_slice(&compressed);
+    Ok(out)
+}
+
+/// Decode an `AAUD` audio bitstream back into an [`AudioTrack`].
+pub fn decode_aaud_bitstream(data: &[u8]) -> Result<AudioTrack, VideoError> {
+    if data.len() < 16 || &data[0..4] != b"AAUD" || data[4] != 1 {
+        return Err(VideoError::InvalidHeader);
+    }
+    let codec = match data[5] {
+        0 => AudioCodecProfile::Pcm16Le,
+        1 => AudioCodecProfile::ImaAdpcm4,
+        _ => return Err(VideoError::InvalidHeader),
+    };
+    let channels = data[6];
+    if channels == 0 || channels > 2 {
+        return Err(VideoError::InvalidHeader);
+    }
+    let sample_rate = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+    let sample_count = u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize;
+    if sample_rate == 0 || sample_count > MAX_PACKET_BYTES / 2 {
+        return Err(VideoError::InvalidHeader);
+    }
+    let expected_raw = match codec {
+        AudioCodecProfile::Pcm16Le => sample_count * 2,
+        AudioCodecProfile::ImaAdpcm4 => (sample_count + 1) / 2,
+    };
+    let raw = decompress_zlib_bounded(&data[16..], expected_raw.max(1))?;
+    if raw.len() != expected_raw {
+        return Err(VideoError::CorruptedBitstream);
+    }
+    let mut samples = Vec::with_capacity(sample_count);
+    match codec {
+        AudioCodecProfile::Pcm16Le => {
+            for chunk in raw.chunks_exact(2) {
+                samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+            }
+        }
+        AudioCodecProfile::ImaAdpcm4 => {
+            let ch = channels as usize;
+            let mut pred = [0i32; 2];
+            let mut idx = [0i32; 2];
+            for i in 0..sample_count {
+                let byte = raw[i / 2];
+                let nib = if (i & 1) == 0 {
+                    byte & 0x0F
+                } else {
+                    (byte >> 4) & 0x0F
+                };
+                let c = i % ch;
+                samples.push(ima_adpcm_decode_step(nib, &mut pred[c], &mut idx[c]));
+            }
+        }
+    }
+    Ok(AudioTrack {
+        sample_rate,
+        channels,
+        codec,
+        samples,
+    })
+}
+
 /// Pick a [`GpuVideoBackend`] from `hardware_enabled` and the compile target.
 ///
 /// `false` returns [`GpuVideoBackend::SoftwareFallback`]. Otherwise Windows returns
@@ -374,6 +645,8 @@ pub struct VideoClip {
     pub profile: VideoCodecProfile,
     /// Frames in bitstream order.
     pub frames: Vec<VideoFrame>,
+    /// Optional decoded audio track carried in a dual-track `AAVM` container.
+    pub audio: Option<AudioTrack>,
 }
 
 impl VideoClip {
@@ -415,6 +688,14 @@ impl VideoClip {
         }
         Some(chosen)
     }
+
+    /// Peak audio amplitude (`0..=100`) at `timestamp_ms`, or `0` when no audio track is present.
+    pub fn peak_audio_level_at_ms(&self, timestamp_ms: u32) -> u8 {
+        self.audio
+            .as_ref()
+            .map(|a| a.peak_level_at_ms(timestamp_ms, 33))
+            .unwrap_or(0)
+    }
 }
 
 /// Fields copied from a container. `mdat` bytes are not decoded.
@@ -450,6 +731,12 @@ pub struct Mp4Metadata {
     pub iv: Option<[u8; 16]>,
     /// How many `pssh` boxes had a payload of at least 20 bytes.
     pub pssh_count: usize,
+    /// `true` when an audio `hdlr` (`"soun"`) or `smhd` box was seen in `moov`.
+    pub has_audio_track: bool,
+    /// Audio sample rate from the `soun` handler or `AAUD` stream, when present.
+    pub audio_sample_rate: u32,
+    /// Audio channel count from the `soun` handler or `AAUD` stream, when present.
+    pub audio_channels: u8,
 }
 
 /// Label stored beside the demo key list. Selecting a variant does not load a module.
@@ -797,6 +1084,24 @@ impl GpuVideoSession {
     /// [`probe_platform_gpu_backend`] of the stored decode flag, not a device result.
     /// `frames_decoded` grows by one per emitted frame.
     pub fn decode_avid(&mut self, data: &[u8]) -> Result<VideoClip, VideoError> {
+        let (data, audio_slice) = if data.len() >= 12 && &data[0..4] == b"AAVM" {
+            let avid_len = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+            let aaud_len = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
+            if avid_len > MAX_PACKET_BYTES
+                || aaud_len > MAX_PACKET_BYTES
+                || 12 + avid_len + aaud_len > data.len()
+            {
+                return Err(VideoError::CorruptedBitstream);
+            }
+            let aaud = if aaud_len > 0 {
+                Some(&data[12 + avid_len..12 + avid_len + aaud_len])
+            } else {
+                None
+            };
+            (&data[12..12 + avid_len], aaud)
+        } else {
+            (data, None)
+        };
         // Magic through frame count is 24 bytes. Offset 6 (flag) and 7 (reserved) are unread.
         if data.len() < 24 || &data[0..4] != b"AVID" {
             return Err(VideoError::InvalidHeader);
@@ -897,6 +1202,10 @@ impl GpuVideoSession {
             backend: active_backend,
             profile: VideoCodecProfile::AnvilNv12Temporal,
             frames,
+            audio: match audio_slice {
+                Some(raw_aaud) => Some(decode_aaud_bitstream(raw_aaud)?),
+                None => None,
+            },
         })
     }
 
@@ -910,6 +1219,30 @@ impl GpuVideoSession {
         let height = frames[0].height;
         let duration_ms = frames.last().map(|f| f.pts_ms).unwrap_or(0);
         Ok(wrap_mp4_container(width, height, duration_ms, &avid_stream))
+    }
+
+    /// Encode `frames` as `AVID` and an optional [`AudioTrack`] as `AAUD`, then mux both into an MP4.
+    pub fn encode_av_mp4(
+        &mut self,
+        fps: u32,
+        frames: &[VideoFrame],
+        audio: Option<&AudioTrack>,
+    ) -> Result<Vec<u8>, VideoError> {
+        let avid_stream = self.encode_avid(fps, frames)?;
+        let width = frames[0].width;
+        let height = frames[0].height;
+        let duration_ms = frames.last().map(|f| f.pts_ms).unwrap_or(0);
+        let aaud_stream = match audio {
+            Some(track) => Some(encode_aaud_bitstream(track)?),
+            None => None,
+        };
+        Ok(wrap_av_mp4_container(
+            width,
+            height,
+            duration_ms,
+            &avid_stream,
+            aaud_stream.as_deref(),
+        ))
     }
 
     /// Encode `frames` as `AVID`, then wrap that bitstream as one AES-128-CTR sample.
@@ -1037,6 +1370,84 @@ pub fn wrap_mp4_container(
     out
 }
 
+/// Mux an `AVID` video bitstream and an optional `AAUD` audio bitstream into an ISOBMFF MP4 container.
+///
+/// When `aaud_payload` is `Some`, a second `trak` box (`mdia` -> `hdlr` `"soun"` + `minf` -> `smhd`)
+/// is written into `moov` and `mdat` carries a dual-chunk `AAVM` payload (`b"AAVM"`, `avid_len`, `aaud_len`).
+pub fn wrap_av_mp4_container(
+    width: u32,
+    height: u32,
+    duration_ms: u32,
+    avid_payload: &[u8],
+    aaud_payload: Option<&[u8]>,
+) -> Vec<u8> {
+    let Some(aaud) = aaud_payload else {
+        return wrap_mp4_container(width, height, duration_ms, avid_payload);
+    };
+
+    let mut out = Vec::new();
+    let mut ftyp = Vec::new();
+    ftyp.extend_from_slice(b"isom");
+    ftyp.extend_from_slice(&512u32.to_be_bytes());
+    ftyp.extend_from_slice(b"isommp42");
+    write_mp4_box(&mut out, *b"ftyp", &ftyp);
+
+    let mut mvhd = Vec::new();
+    mvhd.extend_from_slice(&0u32.to_be_bytes());
+    mvhd.extend_from_slice(&1000u32.to_be_bytes());
+    mvhd.extend_from_slice(&duration_ms.to_be_bytes());
+
+    let mut tkhd = Vec::new();
+    tkhd.extend_from_slice(&1u32.to_be_bytes());
+    tkhd.extend_from_slice(&width.to_be_bytes());
+    tkhd.extend_from_slice(&height.to_be_bytes());
+
+    let mut video_trak = Vec::new();
+    write_mp4_box(&mut video_trak, *b"tkhd", &tkhd);
+
+    let (sample_rate, channels) = if aaud.len() >= 16 && &aaud[0..4] == b"AAUD" {
+        (
+            u32::from_be_bytes([aaud[8], aaud[9], aaud[10], aaud[11]]),
+            aaud[6],
+        )
+    } else {
+        (44_100, 2)
+    };
+
+    let mut hdlr = Vec::new();
+    hdlr.extend_from_slice(&0u32.to_be_bytes());
+    hdlr.extend_from_slice(b"soun");
+    hdlr.extend_from_slice(&sample_rate.to_be_bytes());
+    hdlr.push(channels);
+    hdlr.push(0);
+
+    let smhd = [0u8; 8];
+    let mut minf = Vec::new();
+    write_mp4_box(&mut minf, *b"smhd", &smhd);
+
+    let mut mdia = Vec::new();
+    write_mp4_box(&mut mdia, *b"hdlr", &hdlr);
+    write_mp4_box(&mut mdia, *b"minf", &minf);
+
+    let mut audio_trak = Vec::new();
+    write_mp4_box(&mut audio_trak, *b"mdia", &mdia);
+
+    let mut moov = Vec::new();
+    write_mp4_box(&mut moov, *b"mvhd", &mvhd);
+    write_mp4_box(&mut moov, *b"trak", &video_trak);
+    write_mp4_box(&mut moov, *b"trak", &audio_trak);
+    write_mp4_box(&mut out, *b"moov", &moov);
+
+    let mut mdat_payload = Vec::with_capacity(12 + avid_payload.len() + aaud.len());
+    mdat_payload.extend_from_slice(b"AAVM");
+    mdat_payload.extend_from_slice(&(avid_payload.len() as u32).to_be_bytes());
+    mdat_payload.extend_from_slice(&(aaud.len() as u32).to_be_bytes());
+    mdat_payload.extend_from_slice(avid_payload);
+    mdat_payload.extend_from_slice(aaud);
+    write_mp4_box(&mut out, *b"mdat", &mdat_payload);
+    out
+}
+
 /// Put one AES-128-CTR sample in an MP4 and record `cenc` labels in `moov`.
 ///
 /// Boxes match [`wrap_mp4_container`], with two changes. Compatible brands are `isom`
@@ -1148,6 +1559,9 @@ pub fn inspect_mp4_metadata(data: &[u8]) -> Result<Mp4Metadata, VideoError> {
         default_kid: None,
         iv: None,
         pssh_count: 0,
+        has_audio_track: false,
+        audio_sample_rate: 0,
+        audio_channels: 0,
     };
     let mut saw_moov = false;
     let mut saw_mdat = false;
@@ -1259,6 +1673,17 @@ fn scan_mp4_boxes(
                 meta.mdat_size = payload.len();
                 *saw_mdat = true;
             }
+            b"hdlr" if payload.len() >= 14 => {
+                if &payload[4..8] == b"soun" {
+                    meta.has_audio_track = true;
+                    meta.audio_sample_rate =
+                        u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
+                    meta.audio_channels = payload[12];
+                }
+            }
+            b"smhd" if payload.len() >= 8 => {
+                meta.has_audio_track = true;
+            }
             _ => {}
         }
         cursor += box_size;
@@ -1359,8 +1784,11 @@ pub fn generate_demo_mp4(width: u32, height: u32, frame_count: u32) -> Result<Ve
         frames.push(VideoFrame::new(width, height, f * 33, f == 0, rgba)?);
     }
 
+    let duration_ms = (count * 33).max(100);
+    let audio =
+        AudioTrack::synthesize_harmonic_chime(duration_ms, 44_100, 2, AudioCodecProfile::ImaAdpcm4);
     let mut session = GpuVideoSession::default();
-    session.encode_mp4(30, &frames)
+    session.encode_av_mp4(30, &frames, Some(&audio))
 }
 
 /// Build a short demo MP4 whose `mdat` is one AES-128-CTR sample.
@@ -1546,5 +1974,34 @@ mod tests {
         let back = &clip.frames[0].rgba;
         assert_eq!(back.len(), rgba.len());
         assert!((back[0] as i16 - rgba[0] as i16).abs() < 40);
+    }
+
+    #[test]
+    fn encodes_and_decodes_aaud_pcm16_and_ima_adpcm_plus_dual_track_aavm_mp4() {
+        let pcm_track =
+            AudioTrack::synthesize_harmonic_chime(120, 44_100, 2, AudioCodecProfile::Pcm16Le);
+        let aaud_pcm = encode_aaud_bitstream(&pcm_track).unwrap();
+        let decoded_pcm = decode_aaud_bitstream(&aaud_pcm).unwrap();
+        assert_eq!(decoded_pcm, pcm_track);
+        assert!(decoded_pcm.peak_level_at_ms(20, 33) > 10);
+
+        let adpcm_track =
+            AudioTrack::synthesize_harmonic_chime(120, 44_100, 2, AudioCodecProfile::ImaAdpcm4);
+        let aaud_adpcm = encode_aaud_bitstream(&adpcm_track).unwrap();
+        assert!(aaud_adpcm.len() < aaud_pcm.len());
+        let decoded_adpcm = decode_aaud_bitstream(&aaud_adpcm).unwrap();
+        assert_eq!(decoded_adpcm.samples.len(), adpcm_track.samples.len());
+        assert!(decoded_adpcm.peak_level_at_ms(20, 33) > 10);
+
+        let demo_mp4 = generate_demo_mp4(32, 24, 6).unwrap();
+        let meta = inspect_mp4_metadata(&demo_mp4).unwrap();
+        assert!(meta.has_audio_track);
+        assert_eq!(meta.audio_sample_rate, 44_100);
+        assert_eq!(meta.audio_channels, 2);
+
+        let mut session = GpuVideoSession::default();
+        let clip = session.decode_video_auto(&demo_mp4).unwrap();
+        assert!(clip.audio.is_some());
+        assert!(clip.peak_audio_level_at_ms(33) > 10);
     }
 }
