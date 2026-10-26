@@ -428,11 +428,18 @@ pub fn probe_os_audio_backend() -> (OsAudioBackend, u32) {
         use core::ffi::c_void;
         type HModule = *mut c_void;
         type FarProc = *const c_void;
+        // SAFETY: these are the kernel32 signatures for LoadLibraryA and
+        // GetProcAddress. They are only called with NUL-terminated names, and
+        // both results are checked for null before use.
         #[link(name = "kernel32")]
         unsafe extern "system" {
             fn LoadLibraryA(lp_lib_file_name: *const u8) -> HModule;
             fn GetProcAddress(h_module: HModule, lp_proc_name: *const u8) -> FarProc;
         }
+        // SAFETY: the DLL and function names are NUL-terminated literals, and
+        // both handles are checked for null. winmm.dll is never freed, so the
+        // function pointer stays valid, and waveOutGetNumDevs takes no arguments
+        // and returns a u32, the type it is cast to.
         unsafe {
             let winmm = LoadLibraryA(b"winmm.dll\0".as_ptr());
             if !winmm.is_null() {
@@ -537,6 +544,9 @@ impl AudioOutputBridge {
             use core::ffi::c_void;
             type HModule = *mut c_void;
             type FarProc = *const c_void;
+            // SAFETY: these are the kernel32 signatures for LoadLibraryA and
+            // GetProcAddress. They are only called with NUL-terminated names, and
+            // both results are checked for null before use.
             #[link(name = "kernel32")]
             unsafe extern "system" {
                 fn LoadLibraryA(lp_lib_file_name: *const u8) -> HModule;
@@ -546,6 +556,9 @@ impl AudioOutputBridge {
             const SND_NODEFAULT: u32 = 0x0002;
             const SND_MEMORY: u32 = 0x0004;
             let wav = encode_pcm16_wav(track.sample_rate, track.channels, &pcm);
+            // SAFETY: the DLL and function names are NUL-terminated literals, and
+            // both handles are checked for null. winmm.dll is never freed, so the
+            // function pointer stays valid, and sndPlaySoundA has the type it is cast to.
             unsafe {
                 let winmm = LoadLibraryA(b"winmm.dll\0".as_ptr());
                 if !winmm.is_null() {
