@@ -909,32 +909,31 @@ impl VideoFrame {
 /// (with `Filter::Nearest`), falling back to `present_nv12_on_device`.
 pub fn present_nv12_via_compositor(surface: &Nv12Surface) -> Vec<u8> {
     let mut out = present_nv12_on_device(surface);
-    if surface.width > 0
-        && surface.height > 0
-        && let Ok(mut target) = anvil_gpu::RgbaTarget::new(
+    if surface.width > 0 && surface.height > 0 {
+        if let Ok(mut target) = anvil_gpu::RgbaTarget::new(
             &mut out,
             surface.width,
             surface.height,
             (surface.width as usize) * 4,
-        )
-    {
-        let src = anvil_gpu::VideoFrame::Nv12 {
-            width: surface.width,
-            height: surface.height,
-            y_stride: surface.width as usize,
-            y: &surface.y_plane,
-            uv_stride: surface.width as usize,
-            uv: &surface.uv_plane,
-        };
-        let desc = anvil_gpu::BlitDesc {
-            x: 0,
-            y: 0,
-            width: surface.width,
-            height: surface.height,
-            filter: anvil_gpu::Filter::Nearest,
-            clip: None,
-        };
-        let _ = anvil_gpu::Compositor::open().blit_frame(&mut target, &src, &desc);
+        ) {
+            let src = anvil_gpu::VideoFrame::Nv12 {
+                width: surface.width,
+                height: surface.height,
+                y_stride: surface.width as usize,
+                y: &surface.y_plane,
+                uv_stride: surface.width as usize,
+                uv: &surface.uv_plane,
+            };
+            let desc = anvil_gpu::BlitDesc {
+                x: 0,
+                y: 0,
+                width: surface.width,
+                height: surface.height,
+                filter: anvil_gpu::Filter::Nearest,
+                clip: None,
+            };
+            let _ = anvil_gpu::Compositor::open().blit_frame(&mut target, &src, &desc);
+        }
     }
     out
 }

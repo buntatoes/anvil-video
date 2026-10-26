@@ -7,7 +7,7 @@
 
 [package]
 name = "anvil-video"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 authors = ["Buntato <324143321+buntatoes@users.noreply.github.com>"]
 license = "MPL-2.0"
