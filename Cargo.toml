@@ -9,6 +9,7 @@
 name = "anvil-video"
 version = "0.7.1"
 edition = "2024"
+rust-version = "1.99.1"
 authors = ["Buntato <324143321+buntatoes@users.noreply.github.com>"]
 license = "MPL-2.0"
 description = "AVID frames in a small MP4 container. Plane conversion uses the anvil-gpu software device."

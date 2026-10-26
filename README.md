@@ -42,7 +42,7 @@ It needs these directories next to this one:
 cargo test
 ```
 
-Rust 2024 edition, Rust 1.85.1 or newer. Dependencies are the three path crates above. No crates.io dependencies.
+Rust 2024 edition, Rust 1.99.1 or newer. Dependencies are the three path crates above. No crates.io dependencies.
 
 ## The other repositories
 
