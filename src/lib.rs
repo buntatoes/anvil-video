@@ -863,6 +863,98 @@ impl VideoFrame {
             rgba: surface.to_rgba_bt709(),
         })
     }
+
+    /// Blit and scale this frame into `dst_rgba` (`dst_width` by `dst_height`, row stride
+    /// `dst_stride` bytes) at `(x, y, width, height)` through `anvil_gpu::Compositor`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_into(
+        &self,
+        dst_rgba: &mut [u8],
+        dst_width: u32,
+        dst_height: u32,
+        dst_stride: usize,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        bilinear: bool,
+    ) -> Result<(), VideoError> {
+        let mut target = anvil_gpu::RgbaTarget::new(dst_rgba, dst_width, dst_height, dst_stride)
+            .map_err(|_| VideoError::InvalidHeader)?;
+        let src = anvil_gpu::VideoFrame::Rgba {
+            width: self.width,
+            height: self.height,
+            stride: (self.width as usize) * 4,
+            pixels: &self.rgba,
+        };
+        let desc = anvil_gpu::BlitDesc {
+            x,
+            y,
+            width,
+            height,
+            filter: if bilinear {
+                anvil_gpu::Filter::Bilinear
+            } else {
+                anvil_gpu::Filter::Nearest
+            },
+            clip: None,
+        };
+        anvil_gpu::Compositor::open()
+            .blit_frame(&mut target, &src, &desc)
+            .map_err(|_| VideoError::InvalidHeader)
+    }
+}
+
+/// Present an [`Nv12Surface`] into packed RGBA8 through `anvil_gpu::Compositor`
+/// (with `Filter::Nearest`), falling back to `present_nv12_on_device`.
+pub fn present_nv12_via_compositor(surface: &Nv12Surface) -> Vec<u8> {
+    let mut out = present_nv12_on_device(surface);
+    if surface.width > 0
+        && surface.height > 0
+        && let Ok(mut target) = anvil_gpu::RgbaTarget::new(
+            &mut out,
+            surface.width,
+            surface.height,
+            (surface.width as usize) * 4,
+        )
+    {
+        let src = anvil_gpu::VideoFrame::Nv12 {
+            width: surface.width,
+            height: surface.height,
+            y_stride: surface.width as usize,
+            y: &surface.y_plane,
+            uv_stride: surface.width as usize,
+            uv: &surface.uv_plane,
+        };
+        let desc = anvil_gpu::BlitDesc {
+            x: 0,
+            y: 0,
+            width: surface.width,
+            height: surface.height,
+            filter: anvil_gpu::Filter::Nearest,
+            clip: None,
+        };
+        let _ = anvil_gpu::Compositor::open().blit_frame(&mut target, &src, &desc);
+    }
+    out
+}
+
+impl VideoFrame {
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn _unused_frame_check(
+        surface: &Nv12Surface,
+        pts_ms: u32,
+        keyframe: bool,
+    ) -> Result<VideoFrame, VideoError> {
+        Ok(VideoFrame {
+            width: surface.width,
+            height: surface.height,
+            pts_ms,
+            keyframe,
+            rgba: surface.to_rgba_bt709(),
+        })
+    }
 }
 
 /// Frames decoded from one `AVID` bitstream, plus the header fields copied next to them.
@@ -1417,7 +1509,7 @@ impl GpuVideoSession {
             }
 
             let decoded_frame = if self.hardware_decode_enabled {
-                let rgba = present_nv12_on_device(&ref_surface);
+                let rgba = present_nv12_via_compositor(&ref_surface);
                 VideoFrame::new(
                     ref_surface.width,
                     ref_surface.height,
@@ -2212,6 +2304,11 @@ mod tests {
         let back = &clip.frames[0].rgba;
         assert_eq!(back.len(), rgba.len());
         assert!((back[0] as i16 - rgba[0] as i16).abs() < 40);
+        let mut scaled = vec![0u8; 8 * 4 * 4];
+        clip.frames[0]
+            .blit_into(&mut scaled, 8, 4, 32, 0, 0, 8, 4, true)
+            .unwrap();
+        assert_eq!(scaled[3], 255);
     }
 
     #[test]

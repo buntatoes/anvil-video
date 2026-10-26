@@ -24,12 +24,12 @@ It needs these directories next to this one:
 - The container is a small MP4 shell (`ftyp`, `moov`, `mdat`). `wrap_mp4_container`, `wrap_av_mp4_container`, `inspect_mp4_metadata`, and `parse_mp4_container` read and write video-only (`AVID`) and video+audio (`AAVM`, with 16-bit PCM or 4-bit IMA-ADPCM `AAUD` audio) files. `encode_pcm16_wav` writes a `.wav` buffer, and `AudioOutputBridge` tracks audio levels and can hand that buffer to `winmm.dll` on Windows.
 - `cenc_encrypt_sample` and `cenc_decrypt_sample` are AES-128-CTR from `anvil-cipher`. The IV is the initial 16-byte counter.
 - `CdmSession` holds keys in memory for the demo clip. It is not a CDM and it does not talk to a license server.
-- Frame bytes are compressed with `anvil-compress`. When the hardware flag is on, color conversion and present go through `anvil-gpu`. The `AVID` packets are still zlib. This is not an H.264 or AV1 decoder. The browser draws the decoded frame through `composite_rgba_frame` before it paints the controls.
+- Frame bytes are compressed with `anvil-compress`. When the hardware flag is on, NV12 presentation (`present_nv12_via_compositor`) and scaled frame blits (`VideoFrame::blit_into`) run through `anvil_gpu::Compositor` (OpenGL 3.3 on Linux or Direct3D 11 on Windows when the self-test passes, and software otherwise), and RGBA-to-NV12 conversion goes through `anvil-gpu`. The `AVID` packets are still zlib. This is not an H.264 or AV1 decoder.
 
 ## What it does not do
 
 - It does not decode H.264, AV1, or any other production codec. Those names exist as labels on `VideoCodecProfile`.
-- `probe_platform_gpu_backend` still returns a name for the operating system. Plane conversion runs on the anvil-gpu software device. This crate does not open VA-API or Direct3D.
+- `probe_platform_gpu_backend` returns a name for the operating system. This crate does not open VA-API or DXVA2 hardware video decoders; GPU shader passes are run by `anvil-gpu` for `NV12` presentation and frame scaling.
 
 ## Limits
 
@@ -50,12 +50,12 @@ The browser is [anvil-browser](https://github.com/buntatoes/anvil-browser) (Apac
 
 | Repository | What it is |
 | --- | --- |
-| [anvil-cipher](https://github.com/buntatoes/anvil-cipher) | AES-128, AES-256, CTR, AES-256-GCM |
+| [anvil-cipher](https://github.com/buntatoes/anvil-cipher) | AES-128, AES-256, CTR, AES-256-GCM, SHA-256, HMAC-SHA256, HKDF-SHA256 |
 | [anvil-compress](https://github.com/buntatoes/anvil-compress) | DEFLATE, zlib, gzip |
 | [anvil-hpack](https://github.com/buntatoes/anvil-hpack) | HPACK header compression for HTTP/2 |
 | [anvil-image](https://github.com/buntatoes/anvil-image) | PNG, JPEG, GIF, WebP, ICO, BMP, PPM |
 | [anvil-json](https://github.com/buntatoes/anvil-json) | JSON |
-| [anvil-pqc](https://github.com/buntatoes/anvil-pqc) | ML-KEM-768, X25519, X25519MLKEM768, SHA-3 (not used by the browser yet) |
+| [anvil-pqc](https://github.com/buntatoes/anvil-pqc) | ML-KEM-768, X25519, X25519MLKEM768, SHA-3 |
 | [anvil-ttf](https://github.com/buntatoes/anvil-ttf) | TrueType and OpenType (`glyf`, `CFF `, `kern`, `GPOS`) |
 | [anvil-gpu](https://github.com/buntatoes/anvil-gpu) | Compositor passes for boxes, shadows, gradients, and NV12, on the CPU or a GPU |
 | [anvil-video](https://github.com/buntatoes/anvil-video) | CPU frames and PCM/ADPCM audio in a small MP4 container |
