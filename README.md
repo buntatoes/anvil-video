@@ -1,5 +1,5 @@
 <div align="center">
-  <h1>anvil-video</h1>
+  <h1>Anvil Video</h1>
   <p>CPU video (AVID NV12 and ADCT 8x8 integer DCT/IDCT + motion compensation) and audio (PCM, IMA-ADPCM, Rice-coded FLAC frames, and MDCT frames) in small MP4, fMP4, and WebM containers.</p>
   <p>
     <img src="https://img.shields.io/badge/release-v.08-e8c37a?style=flat-square" alt="v.08" />
