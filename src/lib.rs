@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 //! CPU RGBA frames in a small ISOBMFF container, with optional AES-128-CTR on the sample.
 //!
@@ -47,6 +47,9 @@ use std::fmt;
 use anvil_cipher::aes128_ctr;
 use anvil_compress::{CompressError, compress_zlib, decompress_zlib_bounded};
 use anvil_gpu::{Nv12Surface, convert_rgba_on_device, present_nv12_on_device};
+
+pub mod codecs;
+pub use codecs::*;
 
 /// Largest accepted frame width, in pixels.
 pub const MAX_VIDEO_WIDTH: u32 = 4096;
@@ -219,25 +222,26 @@ impl GpuVideoBackend {
     }
 }
 
-/// Four-byte label. This crate does not decode H.264 or AV1.
+/// Four-byte codec profile identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VideoCodecProfile {
-    /// Label whose [`Self::fourcc`] is `avc1`. Not an H.264 decoder.
+    /// H.264 / AVC1 (`avc1`) profile backed by Annex-B NAL unit and DCT/MC bitstream coding.
     H264High,
-    /// Label whose [`Self::fourcc`] is `av01`. Not an AV1 decoder.
+    /// AV1 (`av01`) profile backed by OBU and DCT/MC bitstream coding.
     Av1Main,
+    /// VP9 (`vp09`) profile backed by OBU/WebM and DCT/MC bitstream coding.
+    Vp9Profile0,
     /// Label for the `AVID` bitstream this crate reads and writes. [`Self::fourcc`] is `avid`.
     AnvilNv12Temporal,
 }
 
 impl VideoCodecProfile {
-    /// `avc1`, `av01`, or `avid`. The muxer does not write this code into a sample entry.
-    ///
-    /// The bitstream magic is the separate four bytes `AVID`.
+    /// `avc1`, `av01`, `vp09`, or `avid`.
     pub fn fourcc(self) -> [u8; 4] {
         match self {
             VideoCodecProfile::H264High => *b"avc1",
             VideoCodecProfile::Av1Main => *b"av01",
+            VideoCodecProfile::Vp9Profile0 => *b"vp09",
             VideoCodecProfile::AnvilNv12Temporal => *b"avid",
         }
     }
@@ -253,13 +257,17 @@ const IMA_STEP_TABLE: [i32; 89] = [
     10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
 ];
 
-/// Audio codec profile used inside an `AAUD` stream.
+/// Audio codec profile used inside an `AAUD` stream or standalone `fLaC` / `AMDC` container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioCodecProfile {
     /// Uncompressed 16-bit signed little-endian PCM wrapped in zlib.
     Pcm16Le,
     /// 4-bit IMA-ADPCM adaptive differential pulse-code modulation wrapped in zlib.
     ImaAdpcm4,
+    /// Lossless FLAC (`fLaC`) linear prediction + Rice residual coding.
+    FlacLossless,
+    /// Perceptual 50%-overlapped MDCT (`Opus` / `AAC` frequency-domain coding).
+    OpusMdct,
 }
 
 /// Decoded interleaved 16-bit signed PCM audio track synchronized with a [`VideoClip`].
@@ -632,7 +640,7 @@ fn ima_adpcm_decode_step(nibble: u8, predictor: &mut i32, step_index: &mut i32) 
     *predictor as i16
 }
 
-/// Encode an [`AudioTrack`] into a 16-byte `AAUD` header followed by zlib-compressed audio data.
+/// Encode an [`AudioTrack`] into a 16-byte `AAUD` header followed by compressed audio data.
 pub fn encode_aaud_bitstream(track: &AudioTrack) -> Result<Vec<u8>, VideoError> {
     if track.channels == 0 || track.channels > 2 || track.sample_rate == 0 {
         return Err(VideoError::InvalidHeader);
@@ -643,17 +651,16 @@ pub fn encode_aaud_bitstream(track: &AudioTrack) -> Result<Vec<u8>, VideoError> 
             size: sample_count * 2,
         });
     }
-    let mut raw = Vec::new();
-    let codec_byte = match track.codec {
+    let (codec_byte, compressed) = match track.codec {
         AudioCodecProfile::Pcm16Le => {
-            raw.reserve(sample_count * 2);
+            let mut raw = Vec::with_capacity(sample_count * 2);
             for &s in &track.samples {
                 raw.extend_from_slice(&s.to_le_bytes());
             }
-            0u8
+            (0u8, compress_zlib(&raw))
         }
         AudioCodecProfile::ImaAdpcm4 => {
-            raw.reserve((sample_count + 1) / 2);
+            let mut raw = Vec::with_capacity((sample_count + 1) / 2);
             let ch = track.channels as usize;
             let mut pred = [0i32; 2];
             let mut idx = [0i32; 2];
@@ -671,10 +678,11 @@ pub fn encode_aaud_bitstream(track: &AudioTrack) -> Result<Vec<u8>, VideoError> 
             if (sample_count & 1) != 0 {
                 raw.push(packed_byte);
             }
-            1u8
+            (1u8, compress_zlib(&raw))
         }
+        AudioCodecProfile::FlacLossless => (2u8, encode_flac_stream(track)?),
+        AudioCodecProfile::OpusMdct => (3u8, encode_mdct_audio_stream(track)?),
     };
-    let compressed = compress_zlib(&raw);
     if compressed.len() > MAX_PACKET_BYTES {
         return Err(VideoError::PacketTooLarge {
             size: compressed.len(),
@@ -692,14 +700,22 @@ pub fn encode_aaud_bitstream(track: &AudioTrack) -> Result<Vec<u8>, VideoError> 
     Ok(out)
 }
 
-/// Decode an `AAUD` audio bitstream back into an [`AudioTrack`].
+/// Decode an `AAUD`, `fLaC`, or `MDCT` audio bitstream back into an [`AudioTrack`].
 pub fn decode_aaud_bitstream(data: &[u8]) -> Result<AudioTrack, VideoError> {
+    if data.len() >= 4 && &data[0..4] == b"fLaC" {
+        return decode_flac_stream(data);
+    }
+    if data.len() >= 4 && &data[0..4] == b"MDCT" {
+        return decode_mdct_audio_stream(data);
+    }
     if data.len() < 16 || &data[0..4] != b"AAUD" || data[4] != 1 {
         return Err(VideoError::InvalidHeader);
     }
     let codec = match data[5] {
         0 => AudioCodecProfile::Pcm16Le,
         1 => AudioCodecProfile::ImaAdpcm4,
+        2 => return decode_flac_stream(&data[16..]),
+        3 => return decode_mdct_audio_stream(&data[16..]),
         _ => return Err(VideoError::InvalidHeader),
     };
     let channels = data[6];
@@ -714,6 +730,7 @@ pub fn decode_aaud_bitstream(data: &[u8]) -> Result<AudioTrack, VideoError> {
     let expected_raw = match codec {
         AudioCodecProfile::Pcm16Le => sample_count * 2,
         AudioCodecProfile::ImaAdpcm4 => (sample_count + 1) / 2,
+        AudioCodecProfile::FlacLossless | AudioCodecProfile::OpusMdct => unreachable!(),
     };
     let raw = decompress_zlib_bounded(&data[16..], expected_raw.max(1))?;
     if raw.len() != expected_raw {
@@ -741,6 +758,7 @@ pub fn decode_aaud_bitstream(data: &[u8]) -> Result<AudioTrack, VideoError> {
                 samples.push(ima_adpcm_decode_step(nib, &mut pred[c], &mut idx[c]));
             }
         }
+        AudioCodecProfile::FlacLossless | AudioCodecProfile::OpusMdct => unreachable!(),
     }
     Ok(AudioTrack {
         sample_rate,
@@ -1603,17 +1621,45 @@ impl GpuVideoSession {
         ))
     }
 
-    /// Decode a buffer that is either an MP4 starting with `ftyp` or a raw `AVID` bitstream.
-    ///
-    /// For `ftyp`, metadata is read and the top-level `mdat` payload is taken. When `tenc`
-    /// says the sample is protected, the 16-byte key id (or [`DEFAULT_EME_DEMO_KID`] when
-    /// the file has none) is looked up in the in-memory list. The IV is the 16-byte `pssh`
-    /// value, or 16 zero bytes. [`cenc_decrypt_sample`] runs `aes128_ctr` on the whole
-    /// payload. One successful call increments the decrypt counter by one. A missing key
-    /// returns [`VideoError::MissingDecryptionKey`] and does not decode. A wrong key is
-    /// not reported here. The following `AVID` parse fails if the plaintext is not valid.
-    /// Anything that is not an `ftyp` buffer is passed straight to [`Self::decode_avid`].
+    fn decode_payload_auto(&mut self, payload: &[u8]) -> Result<VideoClip, VideoError> {
+        let hw = self.hardware_decode_enabled;
+        if payload.len() >= 5 && &payload[0..5] == b"\x00\x00\x00\x01\x67" {
+            let mut clip = decode_h264_annexb(payload, hw)?;
+            self.frames_decoded += clip.frames.len() as u64;
+            clip.backend = probe_platform_gpu_backend(hw);
+            return Ok(clip);
+        }
+        if payload.len() >= 3 && &payload[0..3] == b"\x12\x00\x0A" {
+            let mut clip = decode_av1_obu_stream(payload, hw)?;
+            self.frames_decoded += clip.frames.len() as u64;
+            clip.backend = probe_platform_gpu_backend(hw);
+            return Ok(clip);
+        }
+        if payload.len() >= 4 && &payload[0..4] == b"ADCT" {
+            let mut clip = decode_dct_mc_bitstream(payload, hw)?;
+            self.frames_decoded += clip.frames.len() as u64;
+            clip.backend = probe_platform_gpu_backend(hw);
+            return Ok(clip);
+        }
+        self.decode_avid(payload)
+    }
+
+    /// Decode a buffer that is an MP4 (`ftyp`), fragmented MP4 (`moof`), WebM (`\x1A\x45\xDF\xA3`),
+    /// H.264 Annex-B (`\x00\x00\x00\x01\x67`), AV1/VP9 OBU (`\x12\x00\x0A`), `ADCT`, or `AVID` bitstream.
     pub fn decode_video_auto(&mut self, data: &[u8]) -> Result<VideoClip, VideoError> {
+        if data.len() >= 4 && data[0..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+            let (_meta, video_payload) = parse_webm_container(data)?;
+            return self.decode_payload_auto(video_payload);
+        }
+        if data.len() >= 8 && &data[4..8] == b"moof" {
+            let seg = inspect_fmp4_segment(data)?;
+            if !seg.has_media_fragment {
+                return Err(VideoError::InvalidHeader);
+            }
+            let mdat_payload =
+                extract_top_level_box_payload(data, b"mdat").ok_or(VideoError::InvalidHeader)?;
+            return self.decode_payload_auto(mdat_payload);
+        }
         if data.len() >= 8 && &data[4..8] == b"ftyp" {
             let meta = inspect_mp4_metadata(data)?;
             let payload = parse_mp4_container(data)?;
@@ -1627,11 +1673,11 @@ impl GpuVideoSession {
                 let decrypted = cenc_decrypt_sample(&key, &iv, payload);
                 self.cdm_session.decrypted_samples =
                     self.cdm_session.decrypted_samples.saturating_add(1);
-                return self.decode_avid(&decrypted);
+                return self.decode_payload_auto(&decrypted);
             }
-            return self.decode_avid(payload);
+            return self.decode_payload_auto(payload);
         }
-        self.decode_avid(data)
+        self.decode_payload_auto(data)
     }
 }
 
@@ -2350,5 +2396,114 @@ mod tests {
         assert!(bridge_wav > 0);
         assert!(bridge.submitted_samples > 0);
         assert!(bridge.last_peak_level > 10);
+    }
+
+    #[test]
+    fn encodes_and_decodes_dct_mc_h264_annexb_and_av1_obu_video_streams() {
+        let mut frames = Vec::new();
+        for f in 0..4u32 {
+            let mut rgba = vec![0u8; 16 * 16 * 4];
+            for y in 0..16u32 {
+                for x in 0..16u32 {
+                    let i = ((y * 16 + x) * 4) as usize;
+                    rgba[i] = ((x * 12 + f * 8) & 0xFF) as u8;
+                    rgba[i + 1] = ((y * 10 + f * 6) & 0xFF) as u8;
+                    rgba[i + 2] = 140;
+                    rgba[i + 3] = 255;
+                }
+            }
+            frames.push(VideoFrame::new(16, 16, f * 33, f == 0, rgba).unwrap());
+        }
+
+        let adct = encode_dct_mc_bitstream(VideoCodecProfile::H264High, 30, 22, &frames).unwrap();
+        assert_eq!(&adct[0..4], b"ADCT");
+        let clip_adct = decode_dct_mc_bitstream(&adct, true).unwrap();
+        assert_eq!(clip_adct.frames.len(), 4);
+        assert_eq!(clip_adct.profile, VideoCodecProfile::H264High);
+
+        let h264 = encode_h264_annexb(30, 22, &frames).unwrap();
+        assert_eq!(&h264[0..5], b"\x00\x00\x00\x01\x67");
+        let mut session = GpuVideoSession::default();
+        let clip_h264 = session.decode_video_auto(&h264).unwrap();
+        assert_eq!(clip_h264.frames.len(), 4);
+        assert_eq!(clip_h264.profile, VideoCodecProfile::H264High);
+
+        let av1 = encode_av1_obu_stream(30, 22, &frames).unwrap();
+        assert_eq!(&av1[0..3], b"\x12\x00\x0A");
+        let clip_av1 = session.decode_video_auto(&av1).unwrap();
+        assert_eq!(clip_av1.frames.len(), 4);
+        assert_eq!(clip_av1.profile, VideoCodecProfile::Av1Main);
+    }
+
+    #[test]
+    fn encodes_and_decodes_lossless_flac_and_perceptual_mdct_audio_streams() {
+        let track =
+            AudioTrack::synthesize_harmonic_chime(80, 44_100, 2, AudioCodecProfile::FlacLossless);
+        let flac_bytes = encode_flac_stream(&track).unwrap();
+        assert_eq!(&flac_bytes[0..4], b"fLaC");
+        let decoded_flac = decode_flac_stream(&flac_bytes).unwrap();
+        assert_eq!(decoded_flac.samples, track.samples);
+        assert_eq!(decoded_flac.codec, AudioCodecProfile::FlacLossless);
+
+        let mdct_track =
+            AudioTrack::synthesize_harmonic_chime(80, 48_000, 2, AudioCodecProfile::OpusMdct);
+        let mdct_bytes = encode_mdct_audio_stream(&mdct_track).unwrap();
+        assert_eq!(&mdct_bytes[0..4], b"MDCT");
+        let decoded_mdct = decode_mdct_audio_stream(&mdct_bytes).unwrap();
+        assert_eq!(decoded_mdct.samples.len(), mdct_track.samples.len());
+        assert_eq!(decoded_mdct.codec, AudioCodecProfile::OpusMdct);
+        assert!(decoded_mdct.peak_level_at_ms(20, 33) > 5);
+    }
+
+    #[test]
+    fn muxes_and_demuxes_fmp4_mse_segments_and_webm_ebml_containers() {
+        let rgba = vec![80u8, 160, 220, 255].repeat(16 * 16);
+        let frame = VideoFrame::new(16, 16, 0, true, rgba).unwrap();
+        let av1 = encode_av1_obu_stream(30, 20, std::slice::from_ref(&frame)).unwrap();
+
+        let webm = wrap_webm_container(16, 16, 40, "V_AV1", &av1);
+        let webm_meta = inspect_webm_metadata(&webm).unwrap();
+        assert_eq!(webm_meta.doc_type, "webm");
+        assert_eq!(webm_meta.width, 16);
+        assert_eq!(webm_meta.height, 16);
+        assert_eq!(webm_meta.video_codec_id, "V_AV1");
+
+        let mut session = GpuVideoSession::default();
+        let webm_clip = session.decode_video_auto(&webm).unwrap();
+        assert_eq!(webm_clip.frames.len(), 1);
+
+        let init_seg = wrap_fmp4_init_segment(16, 16, VideoCodecProfile::Av1Main, false);
+        let media_seg = wrap_fmp4_media_segment(1, 0, &[33], &av1);
+        let mut mse = MseSourceBufferEngine::new("video/mp4; codecs=\"av01.0.04M.08\"");
+        assert_eq!(mse.append_buffer(&init_seg).unwrap(), 0);
+        assert!(mse.init_received());
+        assert_eq!(mse.append_buffer(&media_seg).unwrap(), 1);
+        assert_eq!(mse.frames().len(), 1);
+        assert!(!mse.buffered_ranges().is_empty());
+    }
+
+    #[test]
+    fn runs_w3c_webcodecs_encoder_decoder_and_media_capabilities_queries() {
+        let hw = probe_hardware_video_capabilities();
+        assert!(!hw.adapter_description.is_empty());
+        assert!(hw.supported_profiles.contains(&VideoCodecProfile::H264High));
+
+        let cap = MediaCapabilitiesInfo::query("video/mp4; codecs=\"avc1.640028\"", 1920, 1080, 60);
+        assert!(cap.supported);
+        assert!(cap.smooth);
+
+        let mut encoder = WebCodecsVideoEncoder::new();
+        encoder.configure("avc1.640028", 16, 16, 30, 22).unwrap();
+        let rgba = vec![120u8, 90, 200, 255].repeat(16 * 16);
+        let frame = VideoFrame::new(16, 16, 0, true, rgba).unwrap();
+        let chunk = encoder.encode(&frame, true).unwrap();
+        assert_eq!(chunk.chunk_type, EncodedChunkType::Key);
+        assert!(!chunk.data.is_empty());
+
+        let mut decoder = WebCodecsVideoDecoder::new();
+        decoder.configure("avc1.640028").unwrap();
+        let decoded = decoder.decode(&chunk).unwrap();
+        assert_eq!(decoded.width, 16);
+        assert_eq!(decoded.height, 16);
     }
 }
