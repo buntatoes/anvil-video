@@ -1,6 +1,6 @@
 <div align="center">
   <h1>Anvil Video</h1>
-  <p>CPU video (AVID NV12, ADCT 8x8 integer DCT/IDCT + motion compensation, RFC 6386 VP8, VP9, and AV1 OBU/CDEF) and audio (PCM, IMA-ADPCM, Rice-coded FLAC frames, MDCT frames, and RFC 6716 Opus packets) in small MP4, fMP4, and WebM containers.</p>
+  <p>CPU video (AVID NV12, ADCT 8x8 integer DCT/IDCT + motion compensation, with VP8, VP9, and AV1 style framing) and audio (PCM, IMA-ADPCM, Rice-coded FLAC frames, MDCT frames, and Opus style packets) in small MP4, fMP4, and WebM containers.</p>
   <p>
     <img src="https://img.shields.io/badge/release-v.09-e8c37a?style=flat-square" alt="v.09" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
@@ -27,7 +27,7 @@ It needs these directories next to this one:
 
 ## What it does not do
 
-- It does not decode real H.264 (`avc1`), AV1 (`av01`), VP9 (`vp09`), Opus, or third-party FLAC bitstreams from external sites. The Annex-B NAL and OBU helpers wrap and unwrap `ADCT` payloads produced by this crate, and the codec strings (`avc1.*`, `av01.*`, `vp09.*`) select those internal framing paths.
+- It does not decode real H.264 (`avc1`), VP8 (`vp08`), VP9 (`vp09`), AV1 (`av01`), Opus, or third-party FLAC bitstreams from external sites. The VP8, VP9, AV1, Annex-B NAL, and Opus helpers read and write the real headers, but the payload inside is `ADCT` (video) or `MDCT` (audio) from this crate, and the codec strings (`avc1.*`, `vp08.*`, `vp09.*`, `av01.*`) select those internal framing paths.
 - `probe_platform_gpu_backend` and `probe_hardware_video_capabilities` only inspect the host OS and presence of system libraries or device nodes. This crate does not open VA-API, DXVA2, or D3D11 Video hardware video decoders; all video decoding runs on the CPU before `anvil-gpu` blits `NV12` / `I420` / `RGBA` frames.
 
 ## Limits
