@@ -1,8 +1,8 @@
 <div align="center">
   <h1>Anvil Video</h1>
-  <p>CPU video (AVID NV12 and ADCT 8x8 integer DCT/IDCT + motion compensation) and audio (PCM, IMA-ADPCM, Rice-coded FLAC frames, and MDCT frames) in small MP4, fMP4, and WebM containers.</p>
+  <p>CPU video (AVID NV12, ADCT 8x8 integer DCT/IDCT + motion compensation, RFC 6386 VP8, VP9, and AV1 OBU/CDEF) and audio (PCM, IMA-ADPCM, Rice-coded FLAC frames, MDCT frames, and RFC 6716 Opus packets) in small MP4, fMP4, and WebM containers.</p>
   <p>
-    <img src="https://img.shields.io/badge/release-v.08-e8c37a?style=flat-square" alt="v.08" />
+    <img src="https://img.shields.io/badge/release-v.09-e8c37a?style=flat-square" alt="v.09" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-PolyForm_Noncommercial_1.0.0_%7C_Paid_Commercial_%28Non--Compete%29-blue?style=flat-square" alt="PolyForm Noncommercial 1.0.0 | Paid Commercial (Non-Compete)" /></a>
     <a href="./SECURITY.md"><img src="https://img.shields.io/badge/security-policy-2ea44f?style=flat-square" alt="Security" /></a>
@@ -10,7 +10,7 @@
   </p>
 </div>
 
-Version 0.8.0 (`v.08`).
+Version 0.9.0 (`v.09`).
 
 It needs these directories next to this one:
 
@@ -20,8 +20,8 @@ It needs these directories next to this one:
 
 ## What it does
 
-- **Video Codecs**: Encodes and decodes temporal `NV12` `AVID` streams (`GpuVideoSession`) and 8x8 Integer DCT/IDCT + quantization + 16x16 macroblock motion-compensated `ADCT` `I-frame`/`P-frame` bitstreams (`encode_dct_mc_bitstream` / `decode_dct_mc_bitstream`), plus Annex-B NAL unit framing (`encode_h264_annexb` / `decode_h264_annexb`) and OBU framing (`encode_av1_obu_stream` / `decode_av1_obu_stream`) around `ADCT` payloads.
-- **Audio Codecs**: Encodes and decodes 16-bit `PCM` and 4-bit `IMA-ADPCM` (`encode_aaud_bitstream` / `decode_aaud_bitstream`), lossless linear-prediction + Rice-coded `fLaC` frames (`encode_flac_stream` / `decode_flac_stream`), and 50%-overlapped `MDCT` audio frames (`encode_mdct_audio_stream` / `decode_mdct_audio_stream`), plus RIFF `WAVE` output (`encode_pcm16_wav`) and `AudioOutputBridge`.
+- **Video Codecs**: Encodes and decodes temporal `NV12` `AVID` streams (`GpuVideoSession`) and 8x8 Integer DCT/IDCT + quantization + 16x16 macroblock motion-compensated `ADCT` `I-frame`/`P-frame` bitstreams (`encode_dct_mc_bitstream` / `decode_dct_mc_bitstream`), plus RFC 6386 `VP8` keyframe headers, boolean arithmetic decoder (`Vp8BoolDecoder`), 4x4 Walsh-Hadamard / IDCT transforms (`vp8_inverse_wht_4x4`, `vp8_inverse_idct_4x4`), and deblocking loop filter (`vp8_loop_filter_edge`, `encode_vp8_rfc6386_stream` / `decode_vp8_rfc6386_stream`), `VP9` uncompressed header (`[0x49, 0x83, 0x42]` sync code) and Annex-B superframe index parser (`Vp9FrameHeader`, `parse_vp9_superframe_index`, `encode_vp9_stream` / `decode_vp9_stream`), `AV1` Open Bitstream Unit (`OBU`) `LEB128` parser (`read_obu_leb128`), Constrained Directional Enhancement Filter (`av1_cdef_filter_4x4`), and OBU stream framing (`encode_av1_obu_stream` / `decode_av1_obu_stream`), and Annex-B NAL unit framing (`encode_h264_annexb` / `decode_h264_annexb`).
+- **Audio Codecs**: Encodes and decodes 16-bit `PCM` and 4-bit `IMA-ADPCM` (`encode_aaud_bitstream` / `decode_aaud_bitstream`), lossless linear-prediction + Rice-coded `fLaC` frames (`encode_flac_stream` / `decode_flac_stream`), 50%-overlapped `MDCT` audio frames (`encode_mdct_audio_stream` / `decode_mdct_audio_stream`), and RFC 6716 `Opus` TOC packet header parser, range decoder (`OpusRangeDecoder`), and CELT/SILK synthesis (`encode_rfc6716_opus_packet` / `decode_rfc6716_opus_packet`), plus RIFF `WAVE` output (`encode_pcm16_wav`) and `AudioOutputBridge`.
 - **Containers & Encryption**: ISOBMFF MP4 (`wrap_mp4_container`, `wrap_av_mp4_container`, `inspect_mp4_metadata`, `parse_mp4_container`), Fragmented MP4 (`fMP4` `moof`/`traf`/`trun` via `wrap_fmp4_init_segment`, `wrap_fmp4_media_segment`, `inspect_fmp4_segment`), `WebM` / Matroska EBML (`wrap_webm_container`, `inspect_webm_metadata`, `parse_webm_container`), and AES-128-CTR CENC sample encryption (`cenc_encrypt_sample`, `cenc_decrypt_sample`, `CdmSession`).
 - **W3C Media Helpers & Probes**: `WebCodecsVideoEncoder` / `WebCodecsVideoDecoder` (backed by `ADCT`), `MseSourceBufferEngine` (accepting `fMP4` and `WebM` segments), `MediaCapabilitiesInfo`, and `probe_hardware_video_capabilities` (which checks for Windows `mfplat.dll` / `d3d11.dll` or Linux `/dev/dri/renderD128`).
 

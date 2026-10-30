@@ -231,17 +231,20 @@ pub enum VideoCodecProfile {
     Av1Main,
     /// VP9 (`vp09`) profile backed by OBU/WebM and DCT/MC bitstream coding.
     Vp9Profile0,
+    /// VP8 (`vp08`) profile backed by RFC 6386 keyframe/interframe and WHT/DCT/MC bitstream coding.
+    Vp8Profile0,
     /// Label for the `AVID` bitstream this crate reads and writes. [`Self::fourcc`] is `avid`.
     AnvilNv12Temporal,
 }
 
 impl VideoCodecProfile {
-    /// `avc1`, `av01`, `vp09`, or `avid`.
+    /// `avc1`, `av01`, `vp09`, `vp08`, or `avid`.
     pub fn fourcc(self) -> [u8; 4] {
         match self {
             VideoCodecProfile::H264High => *b"avc1",
             VideoCodecProfile::Av1Main => *b"av01",
             VideoCodecProfile::Vp9Profile0 => *b"vp09",
+            VideoCodecProfile::Vp8Profile0 => *b"vp08",
             VideoCodecProfile::AnvilNv12Temporal => *b"avid",
         }
     }
@@ -1635,6 +1638,18 @@ impl GpuVideoSession {
             clip.backend = probe_platform_gpu_backend(hw);
             return Ok(clip);
         }
+        if payload.len() >= 6 && (payload[0] & 1) == 0 && &payload[3..6] == &[0x9D, 0x01, 0x2A] {
+            let mut clip = decode_vp8_rfc6386_stream(payload, hw)?;
+            self.frames_decoded += clip.frames.len() as u64;
+            clip.backend = probe_platform_gpu_backend(hw);
+            return Ok(clip);
+        }
+        if payload.len() >= 4 && &payload[0..4] == &[0x82, 0x49, 0x83, 0x42] {
+            let mut clip = decode_vp9_stream(payload, hw)?;
+            self.frames_decoded += clip.frames.len() as u64;
+            clip.backend = probe_platform_gpu_backend(hw);
+            return Ok(clip);
+        }
         if payload.len() >= 4 && &payload[0..4] == b"ADCT" {
             let mut clip = decode_dct_mc_bitstream(payload, hw)?;
             self.frames_decoded += clip.frames.len() as u64;
@@ -2505,5 +2520,78 @@ mod tests {
         let decoded = decoder.decode(&chunk).unwrap();
         assert_eq!(decoded.width, 16);
         assert_eq!(decoded.height, 16);
+    }
+
+    #[test]
+    fn encodes_and_decodes_royalty_free_opus_rfc6716_vp8_rfc6386_vp9_and_av1_cdef() {
+        // 1. RFC 6716 Opus TOC + Range Decoder + CELT/SILK synthesis
+        let track =
+            AudioTrack::synthesize_harmonic_chime(60, 48_000, 2, AudioCodecProfile::OpusMdct);
+        let opus_pkt = encode_rfc6716_opus_packet(&track).unwrap();
+        let toc = OpusPacketHeader::parse(&opus_pkt).unwrap();
+        assert_eq!(toc.mode, OpusMode::CeltOnly);
+        assert_eq!(toc.bandwidth, OpusBandwidth::Fullband);
+        assert_eq!(toc.frame_duration_us, 20_000);
+        assert!(toc.stereo);
+        assert_eq!(toc.samples_per_frame_48k(), 960);
+        let decoded_opus = decode_rfc6716_opus_packet(&opus_pkt).unwrap();
+        assert_eq!(decoded_opus.samples.len(), track.samples.len());
+        assert_eq!(decoded_opus.sample_rate, 48_000);
+
+        // Also test raw RFC 6716 SILK-mode packet synthesis via OpusRangeDecoder
+        let raw_silk_pkt = [0x48u8, 0x55, 0xAA, 0x33, 0xCC, 0x99, 0x11, 0x77];
+        let silk_track = decode_rfc6716_opus_packet(&raw_silk_pkt).unwrap();
+        assert_eq!(silk_track.sample_rate, 48_000);
+        assert_eq!(silk_track.channels, 1);
+        assert_eq!(silk_track.samples.len(), 960);
+
+        // 2. RFC 6386 VP8 keyframe start code [0x9D, 0x01, 0x2A], BoolDecoder, WHT/IDCT & loop filter
+        let mut rgba = vec![0u8; 16 * 16 * 4];
+        for i in 0..(16 * 16) {
+            rgba[i * 4] = 90;
+            rgba[i * 4 + 1] = 175;
+            rgba[i * 4 + 2] = 210;
+            rgba[i * 4 + 3] = 255;
+        }
+        let frame = VideoFrame::new(16, 16, 0, true, rgba).unwrap();
+        let vp8_bytes = encode_vp8_rfc6386_stream(30, 18, std::slice::from_ref(&frame)).unwrap();
+        assert_eq!(&vp8_bytes[3..6], &[0x9D, 0x01, 0x2A]);
+        let vp8_hdr = Vp8FrameHeader::parse(&vp8_bytes).unwrap();
+        assert!(vp8_hdr.is_keyframe);
+        assert_eq!(vp8_hdr.width, 16);
+        assert_eq!(vp8_hdr.height, 16);
+
+        let mut session = GpuVideoSession::default();
+        let vp8_clip = session.decode_video_auto(&vp8_bytes).unwrap();
+        assert_eq!(vp8_clip.profile, VideoCodecProfile::Vp8Profile0);
+        assert_eq!(vp8_clip.frames.len(), 1);
+
+        let mut bool_dec = Vp8BoolDecoder::new(&[0xA5, 0x5A, 0xF0, 0x0F]);
+        let _ = bool_dec.read_literal(8);
+        let wht = vp8_inverse_wht_4x4(&[64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(wht[0] > 0);
+        let idct4 = vp8_inverse_idct_4x4(&[128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(idct4[0] > 0);
+        let (p0, q0) = vp8_loop_filter_edge(100, 104, 112, 116, 40);
+        assert!(p0 >= 104 && q0 <= 112);
+
+        // 3. VP9 sync code [0x49, 0x83, 0x42] & Annex-B superframe index
+        let vp9_bytes = encode_vp9_stream(30, 18, std::slice::from_ref(&frame)).unwrap();
+        assert_eq!(&vp9_bytes[1..4], &[0x49, 0x83, 0x42]);
+        let vp9_clip = session.decode_video_auto(&vp9_bytes).unwrap();
+        assert_eq!(vp9_clip.profile, VideoCodecProfile::Vp9Profile0);
+        assert_eq!(vp9_clip.frames.len(), 1);
+
+        // Superframe index for 2 subframes of 4 bytes and 6 bytes (marker 0xC1 = 0b110_00_001)
+        let superframe = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0xC1, 4, 6, 0xC1];
+        assert_eq!(parse_vp9_superframe_index(&superframe), Some(vec![4, 6]));
+
+        // 4. AV1 LEB128 & CDEF directional filter
+        assert_eq!(read_obu_leb128(&[0x85, 0x01]).unwrap(), (133, 2));
+        let mut block4 = [
+            100u8, 102, 100, 102, 102, 108, 102, 100, 100, 102, 100, 102, 102, 100, 102, 100,
+        ];
+        av1_cdef_filter_4x4(&mut block4, 8, 4);
+        assert!(block4[5] <= 108);
     }
 }

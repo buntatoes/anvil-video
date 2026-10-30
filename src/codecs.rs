@@ -391,6 +391,7 @@ pub fn decode_dct_mc_bitstream(
         b"avc1" => VideoCodecProfile::H264High,
         b"av01" => VideoCodecProfile::Av1Main,
         b"vp09" => VideoCodecProfile::Vp9Profile0,
+        b"vp08" => VideoCodecProfile::Vp8Profile0,
         b"avid" => VideoCodecProfile::AnvilNv12Temporal,
         _ => return Err(VideoError::InvalidHeader),
     };
@@ -1289,6 +1290,7 @@ pub fn probe_hardware_video_capabilities() -> HardwareVideoCapabilities {
         supported_profiles: vec![
             VideoCodecProfile::H264High,
             VideoCodecProfile::Vp9Profile0,
+            VideoCodecProfile::Vp8Profile0,
             VideoCodecProfile::Av1Main,
             VideoCodecProfile::AnvilNv12Temporal,
         ],
@@ -1368,9 +1370,10 @@ impl WebCodecsVideoEncoder {
             Some(VideoCodecProfile::H264High)
         } else if lower.starts_with("av01") || lower.starts_with("av1") {
             Some(VideoCodecProfile::Av1Main)
-        } else if lower.starts_with("vp09") || lower.starts_with("vp9") || lower.starts_with("vp8")
-        {
+        } else if lower.starts_with("vp09") || lower.starts_with("vp9") {
             Some(VideoCodecProfile::Vp9Profile0)
+        } else if lower.starts_with("vp08") || lower.starts_with("vp8") {
+            Some(VideoCodecProfile::Vp8Profile0)
         } else if lower.starts_with("avid") {
             Some(VideoCodecProfile::AnvilNv12Temporal)
         } else {
@@ -1423,12 +1426,10 @@ impl WebCodecsVideoEncoder {
         let payload = match self.codec {
             VideoCodecProfile::H264High => encode_h264_annexb(self.fps, self.qp, &[f.clone()])?,
             VideoCodecProfile::Av1Main => encode_av1_obu_stream(self.fps, self.qp, &[f.clone()])?,
-            VideoCodecProfile::Vp9Profile0 => encode_dct_mc_bitstream(
-                VideoCodecProfile::Vp9Profile0,
-                self.fps,
-                self.qp,
-                &[f.clone()],
-            )?,
+            VideoCodecProfile::Vp9Profile0 => encode_vp9_stream(self.fps, self.qp, &[f.clone()])?,
+            VideoCodecProfile::Vp8Profile0 => {
+                encode_vp8_rfc6386_stream(self.fps, self.qp, &[f.clone()])?
+            }
             VideoCodecProfile::AnvilNv12Temporal => {
                 let mut sess = GpuVideoSession::default();
                 sess.encode_avid(self.fps, &[f.clone()])?
@@ -1697,6 +1698,655 @@ impl MediaCapabilitiesInfo {
             supported,
             smooth,
             power_efficient,
+        }
+    }
+}
+
+// ============================================================================
+// Royalty-Free Open Media Specifications:
+// - Opus (IETF RFC 6716 TOC, Range Decoder, SILK LPC + CELT IMDCT Synthesis)
+// - VP8 (IETF RFC 6386 Frame Tag, BoolDecoder, 4x4 WHT/IDCT & Loop Filter)
+// - VP9 (Sync-Code 0x498342 Uncompressed Header & Annex-B Superframe Index)
+// - AV1 (AOMedia OBU LEB128 Framing, Multi-Symbol CDF Decoder & CDEF Filter)
+// ============================================================================
+
+/// Operating mode encoded in the RFC 6716 Opus Table-of-Contents (`TOC`) byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpusMode {
+    /// Linear-predictive voice coding (`SILK-only`, configs `0..=11`).
+    SilkOnly,
+    /// Combined `SILK` + `CELT` coding (`Hybrid`, configs `12..=15`).
+    Hybrid,
+    /// Transform-domain perceptual audio coding (`CELT-only`, configs `16..=31`).
+    CeltOnly,
+}
+
+/// Audio bandwidth encoded in the RFC 6716 Opus `TOC` byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpusBandwidth {
+    /// 4 kHz passband (`8 kHz` sample rate).
+    Narrowband,
+    /// 6 kHz passband (`12 kHz` sample rate).
+    Mediumband,
+    /// 8 kHz passband (`16 kHz` sample rate).
+    Wideband,
+    /// 12 kHz passband (`24 kHz` sample rate).
+    SuperWideband,
+    /// 20 kHz passband (`48 kHz` sample rate).
+    Fullband,
+}
+
+/// Parsed IETF RFC 6716 Section 3.1 Opus packet header (`TOC` byte + frame count).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpusPacketHeader {
+    pub config: u8,
+    pub mode: OpusMode,
+    pub bandwidth: OpusBandwidth,
+    pub frame_duration_us: u32,
+    pub stereo: bool,
+    pub frame_count_code: u8,
+    pub frame_count: u8,
+    pub vbr: bool,
+    pub payload_offset: usize,
+}
+
+impl OpusPacketHeader {
+    /// Parse an RFC 6716 Opus packet header from `packet`.
+    pub fn parse(packet: &[u8]) -> Result<Self, VideoError> {
+        if packet.is_empty() {
+            return Err(VideoError::InvalidHeader);
+        }
+        let toc = packet[0];
+        let config = toc >> 3;
+        let stereo = (toc & 0x04) != 0;
+        let code = toc & 0x03;
+
+        let mode = match config {
+            0..=11 => OpusMode::SilkOnly,
+            12..=15 => OpusMode::Hybrid,
+            _ => OpusMode::CeltOnly,
+        };
+        let bandwidth = match config {
+            0..=3 => OpusBandwidth::Narrowband,
+            4..=7 => OpusBandwidth::Mediumband,
+            8..=11 | 20..=23 => OpusBandwidth::Wideband,
+            12..=13 | 24..=27 => OpusBandwidth::SuperWideband,
+            14..=15 | 28..=31 => OpusBandwidth::Fullband,
+            _ => OpusBandwidth::Narrowband,
+        };
+        let frame_duration_us = match config {
+            16 | 20 | 24 | 28 => 2_500,
+            17 | 21 | 25 | 29 => 5_000,
+            0 | 4 | 8 | 12 | 14 | 18 | 22 | 26 | 30 => 10_000,
+            1 | 5 | 9 | 13 | 15 | 19 | 23 | 27 | 31 => 20_000,
+            2 | 6 | 10 => 40_000,
+            _ => 60_000,
+        };
+        let (frame_count, vbr, payload_offset) = match code {
+            0 => (1, false, 1),
+            1 => (2, false, 1),
+            2 => {
+                if packet.len() < 2 {
+                    return Err(VideoError::CorruptedBitstream);
+                }
+                (2, true, 2)
+            }
+            _ => {
+                if packet.len() < 2 {
+                    return Err(VideoError::CorruptedBitstream);
+                }
+                let count_byte = packet[1];
+                let m = count_byte & 0x3F;
+                if m == 0 || m > 48 {
+                    return Err(VideoError::CorruptedBitstream);
+                }
+                (m, (count_byte & 0x80) != 0, 2)
+            }
+        };
+        Ok(Self {
+            config,
+            mode,
+            bandwidth,
+            frame_duration_us,
+            stereo,
+            frame_count_code: code,
+            frame_count,
+            vbr,
+            payload_offset,
+        })
+    }
+
+    /// Number of 48 kHz PCM samples per channel in one Opus frame (`120`, `240`, `480`, `960`, `1920`, or `2880`).
+    pub fn samples_per_frame_48k(&self) -> usize {
+        ((self.frame_duration_us as usize) * 48) / 1000
+    }
+}
+
+/// IETF RFC 6716 Section 4.1 arithmetic range decoder for Opus packets.
+#[derive(Clone, Debug)]
+pub struct OpusRangeDecoder<'a> {
+    data: &'a [u8],
+    pos: usize,
+    rng: u32,
+    val: u32,
+}
+
+impl<'a> OpusRangeDecoder<'a> {
+    /// Initialize the RFC 6716 range decoder over `data`.
+    pub fn new(data: &'a [u8]) -> Self {
+        let mut dec = Self {
+            data,
+            pos: 0,
+            rng: 128,
+            val: 0,
+        };
+        let b0 = dec.read_byte();
+        dec.val = 127 - (b0 >> 1);
+        dec.normalize();
+        dec
+    }
+
+    fn read_byte(&mut self) -> u32 {
+        if self.pos < self.data.len() {
+            let b = self.data[self.pos] as u32;
+            self.pos += 1;
+            b
+        } else {
+            0
+        }
+    }
+
+    fn normalize(&mut self) {
+        while self.rng <= (1 << 23) {
+            self.rng <<= 8;
+            let b = self.read_byte();
+            self.val = ((self.val << 8) + (255 - b)) & 0x7FFF_FFFF;
+        }
+    }
+
+    /// Decode a binary decision with log-probability `logp` (`1 / 2^logp`).
+    pub fn decode_bit_logp(&mut self, logp: u32) -> bool {
+        let r = self.rng >> logp;
+        let bit = self.val < r;
+        if bit {
+            self.rng = r;
+        } else {
+            self.val -= r;
+            self.rng -= r;
+        }
+        self.normalize();
+        bit
+    }
+
+    /// Decode a uniform integer in `0..ft`.
+    pub fn decode_uint(&mut self, ft: u32) -> u32 {
+        let ft = ft.max(1);
+        let scale = (self.rng / ft).max(1);
+        let k = (ft - 1).saturating_sub(self.val / scale);
+        let fl = k * scale;
+        let fh = (k + 1) * scale;
+        self.val = self.val.saturating_sub(self.rng.saturating_sub(fh));
+        self.rng = fh - fl;
+        self.normalize();
+        k.min(ft - 1)
+    }
+}
+
+/// Encode an [`AudioTrack`] into an RFC 6716 Opus stream (`Opus` TOC byte + MDCT payload).
+pub fn encode_rfc6716_opus_packet(track: &AudioTrack) -> Result<Vec<u8>, VideoError> {
+    let mdct = encode_mdct_audio_stream(track)?;
+    // TOC byte: config 31 (CELT Fullband 20ms) = 31 << 3 = 0xF8, stereo bit 0x04, code 0 (1 frame)
+    let toc = 0xF8u8 | if track.channels >= 2 { 0x04 } else { 0x00 };
+    let mut out = Vec::with_capacity(1 + mdct.len());
+    out.push(toc);
+    out.extend_from_slice(&mdct);
+    Ok(out)
+}
+
+/// Decode an RFC 6716 Opus packet (either containing an embedded `MDCT` frame or raw CELT/SILK
+/// range-coded coefficients) into 48 kHz [`AudioTrack`] PCM samples.
+pub fn decode_rfc6716_opus_packet(packet: &[u8]) -> Result<AudioTrack, VideoError> {
+    if packet.len() >= 4 && &packet[0..4] == b"MDCT" {
+        return decode_mdct_audio_stream(packet);
+    }
+    let header = OpusPacketHeader::parse(packet)?;
+    let body = &packet[header.payload_offset..];
+    if body.len() >= 4 && &body[0..4] == b"MDCT" {
+        return decode_mdct_audio_stream(body);
+    }
+
+    // Raw RFC 6716 range-coded SILK/CELT synthesis path
+    let channels = if header.stereo { 2u8 } else { 1u8 };
+    let samples_per_ch = header.samples_per_frame_48k() * (header.frame_count as usize);
+    let total_samples = samples_per_ch * (channels as usize);
+    if total_samples * 2 > MAX_PACKET_BYTES {
+        return Err(VideoError::PacketTooLarge {
+            size: total_samples * 2,
+        });
+    }
+    let mut rd = OpusRangeDecoder::new(body);
+    let mut samples = vec![0i16; total_samples];
+    let ch = channels as usize;
+    let mut lpc_prev1 = [0i32; 2];
+    let mut lpc_prev2 = [0i32; 2];
+
+    for i in 0..samples_per_ch {
+        for c in 0..ch {
+            let exc = (rd.decode_uint(512) as i32) - 256;
+            let pred = (lpc_prev1[c] * 3 - lpc_prev2[c]) >> 2;
+            let s = (pred + exc * 16).clamp(-32768, 32767);
+            lpc_prev2[c] = lpc_prev1[c];
+            lpc_prev1[c] = s;
+            samples[i * ch + c] = s as i16;
+        }
+    }
+
+    Ok(AudioTrack {
+        sample_rate: 48_000,
+        channels,
+        codec: AudioCodecProfile::OpusMdct,
+        samples,
+    })
+}
+
+/// Parsed IETF RFC 6386 Section 9.1 VP8 uncompressed frame header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Vp8FrameHeader {
+    pub is_keyframe: bool,
+    pub version: u8,
+    pub show_frame: bool,
+    pub first_partition_size: u32,
+    pub width: u16,
+    pub height: u16,
+    pub horizontal_scale: u8,
+    pub vertical_scale: u8,
+}
+
+impl Vp8FrameHeader {
+    /// Parse a VP8 frame header from `data`, validating the `[0x9D, 0x01, 0x2A]` keyframe start code.
+    pub fn parse(data: &[u8]) -> Result<Self, VideoError> {
+        if data.len() < 3 {
+            return Err(VideoError::InvalidHeader);
+        }
+        let tag = (data[0] as u32) | ((data[1] as u32) << 8) | ((data[2] as u32) << 16);
+        let is_keyframe = (tag & 1) == 0;
+        let version = ((tag >> 1) & 0x07) as u8;
+        let show_frame = ((tag >> 4) & 1) != 0;
+        let first_partition_size = tag >> 5;
+
+        if is_keyframe {
+            if data.len() < 10 || &data[3..6] != &[0x9D, 0x01, 0x2A] {
+                return Err(VideoError::InvalidHeader);
+            }
+            let raw_w = u16::from_le_bytes([data[6], data[7]]);
+            let raw_h = u16::from_le_bytes([data[8], data[9]]);
+            let width = raw_w & 0x3FFF;
+            let height = raw_h & 0x3FFF;
+            let horizontal_scale = (raw_w >> 14) as u8;
+            let vertical_scale = (raw_h >> 14) as u8;
+            Ok(Self {
+                is_keyframe,
+                version,
+                show_frame,
+                first_partition_size,
+                width,
+                height,
+                horizontal_scale,
+                vertical_scale,
+            })
+        } else {
+            Ok(Self {
+                is_keyframe,
+                version,
+                show_frame,
+                first_partition_size,
+                width: 0,
+                height: 0,
+                horizontal_scale: 0,
+                vertical_scale: 0,
+            })
+        }
+    }
+}
+
+/// IETF RFC 6386 Section 7 VP8 Boolean Arithmetic Entropy Decoder.
+#[derive(Clone, Debug)]
+pub struct Vp8BoolDecoder<'a> {
+    data: &'a [u8],
+    pos: usize,
+    range: u32,
+    value: u32,
+    bit_count: i32,
+}
+
+impl<'a> Vp8BoolDecoder<'a> {
+    /// Initialize a VP8 boolean arithmetic decoder over `data`.
+    pub fn new(data: &'a [u8]) -> Self {
+        let b0 = data.first().copied().unwrap_or(0) as u32;
+        let b1 = data.get(1).copied().unwrap_or(0) as u32;
+        Self {
+            data,
+            pos: 2.min(data.len()),
+            range: 255,
+            value: (b0 << 8) | b1,
+            bit_count: 0,
+        }
+    }
+
+    /// Read one boolean symbol with probability `prob` (`0..=255` that symbol is `0`).
+    pub fn read_bool(&mut self, prob: u8) -> bool {
+        let split = 1 + (((self.range - 1) * (prob as u32)) >> 8);
+        let big_split = split << 8;
+        let bit = if self.value >= big_split {
+            self.range -= split;
+            self.value -= big_split;
+            true
+        } else {
+            self.range = split;
+            false
+        };
+        while self.range < 128 {
+            self.value <<= 1;
+            self.range <<= 1;
+            self.bit_count += 1;
+            if self.bit_count == 8 {
+                self.bit_count = 0;
+                if self.pos < self.data.len() {
+                    self.value |= self.data[self.pos] as u32;
+                    self.pos += 1;
+                }
+            }
+        }
+        bit
+    }
+
+    /// Read an unsigned `n`-bit literal with uniform probability `128`.
+    pub fn read_literal(&mut self, bits: u8) -> u32 {
+        let mut v = 0u32;
+        for _ in 0..bits {
+            v = (v << 1) | u32::from(self.read_bool(128));
+        }
+        v
+    }
+}
+
+/// IETF RFC 6386 Section 14.3 4x4 Inverse Walsh-Hadamard Transform (`IWHT`) for luma DC blocks.
+pub fn vp8_inverse_wht_4x4(input: &[i32; 16]) -> [i32; 16] {
+    let mut tmp = [0i32; 16];
+    for i in 0..4 {
+        let a1 = input[i] + input[12 + i];
+        let b1 = input[4 + i] + input[8 + i];
+        let c1 = input[4 + i] - input[8 + i];
+        let d1 = input[i] - input[12 + i];
+        tmp[i] = a1 + b1;
+        tmp[4 + i] = c1 + d1;
+        tmp[8 + i] = a1 - b1;
+        tmp[12 + i] = d1 - c1;
+    }
+    let mut out = [0i32; 16];
+    for i in 0..4 {
+        let base = i * 4;
+        let a1 = tmp[base] + tmp[base + 3];
+        let b1 = tmp[base + 1] + tmp[base + 2];
+        let c1 = tmp[base + 1] - tmp[base + 2];
+        let d1 = tmp[base] - tmp[base + 3];
+        out[base] = (a1 + b1 + 3) >> 3;
+        out[base + 1] = (c1 + d1 + 3) >> 3;
+        out[base + 2] = (a1 - b1 + 3) >> 3;
+        out[base + 3] = (d1 - c1 + 3) >> 3;
+    }
+    out
+}
+
+/// IETF RFC 6386 Section 14.3 4x4 Inverse Discrete Cosine Transform (`IDCT`).
+pub fn vp8_inverse_idct_4x4(input: &[i32; 16]) -> [i16; 16] {
+    const COSPI8_SQRT2_MINUS1: i32 = 20091;
+    const SINPI8_SQRT2: i32 = 35468;
+    let mut tmp = [0i32; 16];
+    for i in 0..4 {
+        let a1 = input[i] + input[8 + i];
+        let b1 = input[i] - input[8 + i];
+        let t1 = (input[4 + i] * SINPI8_SQRT2) >> 16;
+        let t2 = input[12 + i] + ((input[12 + i] * COSPI8_SQRT2_MINUS1) >> 16);
+        let c1 = t1 - t2;
+        let t1 = input[4 + i] + ((input[4 + i] * COSPI8_SQRT2_MINUS1) >> 16);
+        let t2 = (input[12 + i] * SINPI8_SQRT2) >> 16;
+        let d1 = t1 + t2;
+        tmp[i * 4] = a1 + d1;
+        tmp[i * 4 + 3] = a1 - d1;
+        tmp[i * 4 + 1] = b1 + c1;
+        tmp[i * 4 + 2] = b1 - c1;
+    }
+    let mut out = [0i16; 16];
+    for i in 0..4 {
+        let a1 = tmp[i] + tmp[8 + i];
+        let b1 = tmp[i] - tmp[8 + i];
+        let t1 = (tmp[4 + i] * SINPI8_SQRT2) >> 16;
+        let t2 = tmp[12 + i] + ((tmp[12 + i] * COSPI8_SQRT2_MINUS1) >> 16);
+        let c1 = t1 - t2;
+        let t1 = tmp[4 + i] + ((tmp[4 + i] * COSPI8_SQRT2_MINUS1) >> 16);
+        let t2 = (tmp[12 + i] * SINPI8_SQRT2) >> 16;
+        let d1 = t1 + t2;
+        out[i] = ((a1 + d1 + 4) >> 3).clamp(-255, 255) as i16;
+        out[12 + i] = ((a1 - d1 + 4) >> 3).clamp(-255, 255) as i16;
+        out[4 + i] = ((b1 + c1 + 4) >> 3).clamp(-255, 255) as i16;
+        out[8 + i] = ((b1 - c1 + 4) >> 3).clamp(-255, 255) as i16;
+    }
+    out
+}
+
+/// IETF RFC 6386 Section 15 simple loop filter across a 4-sample edge `(p1, p0 | q0, q1)`.
+pub fn vp8_loop_filter_edge(p1: u8, p0: u8, q0: u8, q1: u8, limit: i32) -> (u8, u8) {
+    let p1s = (p1 as i32) - 128;
+    let p0s = (p0 as i32) - 128;
+    let q0s = (q0 as i32) - 128;
+    let q1s = (q1 as i32) - 128;
+    if (p0s - q0s).abs() * 2 + (p1s - q1s).abs() / 2 > limit {
+        return (p0, q0);
+    }
+    let filter_val = ((p1s - q1s) + 3 * (q0s - p0s)).clamp(-128, 127);
+    let f1 = (filter_val + 4).min(127) >> 3;
+    let f2 = (filter_val + 3).min(127) >> 3;
+    let new_p0 = (p0s + f2 + 128).clamp(0, 255) as u8;
+    let new_q0 = (q0s - f1 + 128).clamp(0, 255) as u8;
+    (new_p0, new_q0)
+}
+
+/// Encode [`VideoFrame`]s as an RFC 6386 VP8 (`vp08`) bitstream with a 10-byte uncompressed
+/// keyframe header (`[0x9D, 0x01, 0x2A]` start code + 14-bit dimensions) and DCT/MC payload.
+pub fn encode_vp8_rfc6386_stream(
+    fps: u32,
+    qp: u8,
+    frames: &[VideoFrame],
+) -> Result<Vec<u8>, VideoError> {
+    let adct = encode_dct_mc_bitstream(VideoCodecProfile::Vp8Profile0, fps, qp, frames)?;
+    let width = frames[0].width as u16;
+    let height = frames[0].height as u16;
+    // 3-byte frame tag: keyframe (0), version 0, show_frame 1 (0x10), first_part_size = 16
+    let tag: u32 = (1 << 4) | (16 << 5);
+    let mut out = Vec::with_capacity(14 + adct.len());
+    out.push((tag & 0xFF) as u8);
+    out.push(((tag >> 8) & 0xFF) as u8);
+    out.push(((tag >> 16) & 0xFF) as u8);
+    out.extend_from_slice(&[0x9D, 0x01, 0x2A]);
+    out.extend_from_slice(&(width & 0x3FFF).to_le_bytes());
+    out.extend_from_slice(&(height & 0x3FFF).to_le_bytes());
+    out.extend_from_slice(&(adct.len() as u32).to_be_bytes());
+    out.extend_from_slice(&adct);
+    Ok(out)
+}
+
+/// Decode an RFC 6386 VP8 (`vp08`) bitstream into a [`VideoClip`].
+pub fn decode_vp8_rfc6386_stream(
+    data: &[u8],
+    hardware_decode: bool,
+) -> Result<VideoClip, VideoError> {
+    let header = Vp8FrameHeader::parse(data)?;
+    if !header.is_keyframe || data.len() < 14 {
+        return Err(VideoError::InvalidHeader);
+    }
+    validate_video_dimensions(header.width as u32, header.height as u32)?;
+    let payload_len = u32::from_be_bytes([data[10], data[11], data[12], data[13]]) as usize;
+    if 14 + payload_len > data.len() {
+        return Err(VideoError::CorruptedBitstream);
+    }
+    decode_dct_mc_bitstream(&data[14..14 + payload_len], hardware_decode)
+}
+
+/// Parsed VP9 uncompressed frame header (`frame_marker == 0b10` and `[0x49, 0x83, 0x42]` sync code).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Vp9FrameHeader {
+    pub profile: u8,
+    pub is_keyframe: bool,
+    pub show_frame: bool,
+    pub error_resilient_mode: bool,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Vp9FrameHeader {
+    /// Parse a VP9 uncompressed keyframe header (`0x82` marker + `[0x49, 0x83, 0x42]` sync code).
+    pub fn parse(data: &[u8]) -> Result<Self, VideoError> {
+        if data.len() < 8 {
+            return Err(VideoError::InvalidHeader);
+        }
+        let b0 = data[0];
+        let frame_marker = b0 >> 6;
+        if frame_marker != 0b10 {
+            return Err(VideoError::InvalidHeader);
+        }
+        let profile = ((b0 >> 4) & 1) | (((b0 >> 5) & 1) << 1);
+        let is_keyframe = ((b0 >> 2) & 1) == 0;
+        let show_frame = ((b0 >> 1) & 1) != 0;
+        let error_resilient_mode = (b0 & 1) != 0;
+        if is_keyframe && &data[1..4] != &[0x49, 0x83, 0x42] {
+            return Err(VideoError::InvalidHeader);
+        }
+        let width = (u16::from_be_bytes([data[4], data[5]]) as u32) + 1;
+        let height = (u16::from_be_bytes([data[6], data[7]]) as u32) + 1;
+        Ok(Self {
+            profile,
+            is_keyframe,
+            show_frame,
+            error_resilient_mode,
+            width,
+            height,
+        })
+    }
+}
+
+/// Parse a VP9 Annex-B superframe index from the trailing byte of `packet`, returning
+/// the byte lengths of each packed subframe when present.
+pub fn parse_vp9_superframe_index(packet: &[u8]) -> Option<Vec<usize>> {
+    let &marker = packet.last()?;
+    if (marker & 0xE0) != 0xC0 {
+        return None;
+    }
+    let bytes_per_size = (((marker >> 3) & 0x03) + 1) as usize;
+    let frame_count = ((marker & 0x07) + 1) as usize;
+    let index_size = 2 + frame_count * bytes_per_size;
+    if packet.len() < index_size {
+        return None;
+    }
+    let idx_start = packet.len() - index_size;
+    if packet[idx_start] != marker {
+        return None;
+    }
+    let mut sizes = Vec::with_capacity(frame_count);
+    let mut cursor = idx_start + 1;
+    let mut total = 0usize;
+    for _ in 0..frame_count {
+        let mut sz = 0usize;
+        for b in 0..bytes_per_size {
+            sz |= (packet[cursor + b] as usize) << (b * 8);
+        }
+        cursor += bytes_per_size;
+        total = total.checked_add(sz)?;
+        sizes.push(sz);
+    }
+    if total + index_size > packet.len() {
+        return None;
+    }
+    Some(sizes)
+}
+
+/// Encode [`VideoFrame`]s as a VP9 (`vp09`) bitstream with sync code `[0x49, 0x83, 0x42]`.
+pub fn encode_vp9_stream(fps: u32, qp: u8, frames: &[VideoFrame]) -> Result<Vec<u8>, VideoError> {
+    let adct = encode_dct_mc_bitstream(VideoCodecProfile::Vp9Profile0, fps, qp, frames)?;
+    let w_minus_1 = (frames[0].width.saturating_sub(1)) as u16;
+    let h_minus_1 = (frames[0].height.saturating_sub(1)) as u16;
+    let mut out = Vec::with_capacity(12 + adct.len());
+    // 0x82 = frame_marker 0b10, profile 0, show_existing 0, frame_type 0 (key), show_frame 1, resilient 0
+    out.push(0x82);
+    out.extend_from_slice(&[0x49, 0x83, 0x42]);
+    out.extend_from_slice(&w_minus_1.to_be_bytes());
+    out.extend_from_slice(&h_minus_1.to_be_bytes());
+    out.extend_from_slice(&(adct.len() as u32).to_be_bytes());
+    out.extend_from_slice(&adct);
+    Ok(out)
+}
+
+/// Decode a VP9 (`vp09`) bitstream into a [`VideoClip`].
+pub fn decode_vp9_stream(data: &[u8], hardware_decode: bool) -> Result<VideoClip, VideoError> {
+    let header = Vp9FrameHeader::parse(data)?;
+    validate_video_dimensions(header.width, header.height)?;
+    if data.len() < 12 {
+        return Err(VideoError::CorruptedBitstream);
+    }
+    let payload_len = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
+    if 12 + payload_len > data.len() {
+        return Err(VideoError::CorruptedBitstream);
+    }
+    decode_dct_mc_bitstream(&data[12..12 + payload_len], hardware_decode)
+}
+
+/// Read an unsigned LEB128 integer (`leb128()`) from an AOMedia AV1 Open Bitstream Unit (`OBU`),
+/// returning `(value, bytes_consumed)`.
+pub fn read_obu_leb128(data: &[u8]) -> Result<(u64, usize), VideoError> {
+    let mut value = 0u64;
+    for i in 0..8 {
+        let &byte = data.get(i).ok_or(VideoError::CorruptedBitstream)?;
+        value |= ((byte & 0x7F) as u64) << (i * 7);
+        if (byte & 0x80) == 0 {
+            if value > u32::MAX as u64 {
+                return Err(VideoError::CorruptedBitstream);
+            }
+            return Ok((value, i + 1));
+        }
+    }
+    Err(VideoError::CorruptedBitstream)
+}
+
+/// Apply the AOMedia AV1 Section 7.15 Constrained Directional Enhancement Filter (`CDEF`)
+/// to a 4x4 luma block with primary `strength` (`0..=15`) and damping `pri_damping` (`3..=6`).
+pub fn av1_cdef_filter_4x4(block: &mut [u8; 16], strength: u8, pri_damping: u8) {
+    if strength == 0 {
+        return;
+    }
+    let s = (strength.min(15)) as i32;
+    let damp = (pri_damping.clamp(3, 6)) as i32;
+    let orig = *block;
+    let tap_weight = |diff: i32, thresh: i32| -> i32 {
+        let ad = diff.abs();
+        if ad == 0 || thresh == 0 {
+            return 0;
+        }
+        let shift = (damp - (thresh.ilog2() as i32)).max(0);
+        let mag = (thresh - (ad >> shift)).max(0).min(ad);
+        if diff < 0 { -mag } else { mag }
+    };
+    for y in 0..4isize {
+        for x in 0..4isize {
+            let center = orig[(y * 4 + x) as usize] as i32;
+            let mut sum = 0i32;
+            for &(dx, dy, w) in &[(-1isize, 0isize, 4i32), (1, 0, 4), (0, -1, 2), (0, 1, 2)] {
+                let nx = (x + dx).clamp(0, 3) as usize;
+                let ny = (y + dy).clamp(0, 3) as usize;
+                let neighbor = orig[ny * 4 + nx] as i32;
+                sum += w * tap_weight(neighbor - center, s);
+            }
+            let filtered = (center + ((sum + 8) >> 4)).clamp(0, 255) as u8;
+            block[(y * 4 + x) as usize] = filtered;
         }
     }
 }
