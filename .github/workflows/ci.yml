@@ -9,7 +9,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, testing]
   pull_request:
   workflow_dispatch:
 
@@ -42,7 +42,7 @@ jobs:
         working-directory: .
         run: |
           for repo in anvil-cipher anvil-compress anvil-gpu; do
-            git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
+            git clone --depth 1 -b "${{ github.ref_name }}" "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo" 2>/dev/null || git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
           done
 
       - name: Install Rust
