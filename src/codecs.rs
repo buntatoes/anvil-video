@@ -602,7 +602,7 @@ pub fn decode_av1_obu_stream(data: &[u8], hardware_decode: bool) -> Result<Video
 }
 
 // ============================================================================
-// Lossless FLAC & Perceptual MDCT (Opus / AAC) Audio Codecs
+// Lossless FLAC & this crate's own MDCT Audio Frames
 // ============================================================================
 
 /// Encode an [`AudioTrack`] into a native `fLaC` lossless audio stream using
@@ -1703,11 +1703,12 @@ impl MediaCapabilitiesInfo {
 }
 
 // ============================================================================
-// Royalty-Free Open Media Specifications:
-// - Opus (IETF RFC 6716 TOC, Range Decoder, SILK LPC + CELT IMDCT Synthesis)
+// Open media format headers. These read and write the real headers, but the
+// payload inside is this crate's own ADCT (video) or MDCT (audio):
+// - Opus (IETF RFC 6716 TOC, Range Decoder, and a simple LPC test path, not real SILK or CELT)
 // - VP8 (IETF RFC 6386 Frame Tag, BoolDecoder, 4x4 WHT/IDCT & Loop Filter)
 // - VP9 (Sync-Code 0x498342 Uncompressed Header & Annex-B Superframe Index)
-// - AV1 (AOMedia OBU LEB128 Framing, Multi-Symbol CDF Decoder & CDEF Filter)
+// - AV1 (AOMedia OBU LEB128 Framing & a 4x4 CDEF-style Filter)
 // ============================================================================
 
 /// Operating mode encoded in the RFC 6716 Opus Table-of-Contents (`TOC`) byte.
@@ -1903,7 +1904,7 @@ pub fn encode_rfc6716_opus_packet(track: &AudioTrack) -> Result<Vec<u8>, VideoEr
     Ok(out)
 }
 
-/// Decode an RFC 6716 Opus packet (either containing an embedded `MDCT` frame or raw CELT/SILK
+/// Decode an RFC 6716 Opus packet (either containing an embedded `MDCT` frame or raw
 /// range-coded coefficients) into 48 kHz [`AudioTrack`] PCM samples.
 pub fn decode_rfc6716_opus_packet(packet: &[u8]) -> Result<AudioTrack, VideoError> {
     if packet.len() >= 4 && &packet[0..4] == b"MDCT" {
@@ -1915,7 +1916,7 @@ pub fn decode_rfc6716_opus_packet(packet: &[u8]) -> Result<AudioTrack, VideoErro
         return decode_mdct_audio_stream(body);
     }
 
-    // Raw RFC 6716 range-coded SILK/CELT synthesis path
+    // Raw packet path: a simple LPC test synthesis, not real SILK or CELT
     let channels = if header.stereo { 2u8 } else { 1u8 };
     let samples_per_ch = header.samples_per_frame_48k() * (header.frame_count as usize);
     let total_samples = samples_per_ch * (channels as usize);

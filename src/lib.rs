@@ -269,7 +269,7 @@ pub enum AudioCodecProfile {
     ImaAdpcm4,
     /// Lossless FLAC (`fLaC`) linear prediction + Rice residual coding.
     FlacLossless,
-    /// Perceptual 50%-overlapped MDCT (`Opus` / `AAC` frequency-domain coding).
+    /// This crate's own 50%-overlapped MDCT frames. Not real Opus or AAC.
     OpusMdct,
 }
 
