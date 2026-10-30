@@ -1,9 +1,10 @@
-# CPU frames in a small MP4 container. Frame packets use anvil-compress (zlib).
-# Plane conversion and present go through anvil-gpu's tile device when the
-# hardware flag is set. The AVID bytes are still zlib packets. No H.264 device.
-# Caller: anvil-browser. anvil-dom (in anvil-engine) only records the video
-# URL and does not link this crate. anvil-raster (also in anvil-engine) does not
-# link this crate either.
+# CPU video/audio codecs (AVID + 8x8 DCT/IDCT ADCT video, PCM/ADPCM/FLAC/MDCT audio),
+# ISOBMFF (.mp4 / fMP4) and WebM/EBML containers, AES-128-CTR sample encryption,
+# and Opus/VP8/VP9/AV1 header parsers and transform/filter helpers.
+# Frame packets use anvil-compress (zlib). Plane conversion and present go
+# through anvil-gpu's compositor or tile device.
+# Callers: anvil-browser and anvil-script (in anvil-engine). anvil-dom only
+# records the video URL and does not link this crate.
 
 [package]
 name = "anvil-video"
@@ -12,7 +13,7 @@ edition = "2024"
 rust-version = "1.99.1"
 authors = ["Buntato"]
 license = "LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial"
-description = "AVID frames in a small MP4 container. Plane conversion uses the anvil-gpu software device."
+description = "AVID/ADCT video, PCM/ADPCM/FLAC/MDCT audio, MP4/fMP4/WebM containers, and Opus/VP8/VP9/AV1 header and framing helpers."
 repository = "https://github.com/buntatoes/anvil-video"
 homepage = "https://github.com/buntatoes/anvil-video"
 readme = "README.md"

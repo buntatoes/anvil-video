@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
-//! CPU RGBA frames in a small ISOBMFF container, with optional AES-128-CTR on the sample.
+//! CPU video and audio containers, `AVID` and `ADCT` frame codecs, AES-128-CTR sample encryption, and media header/framing helpers.
 //!
 //! `wrap_mp4_container` writes three top-level boxes: `ftyp`, `moov`, and `mdat`.
 //! `moov` holds `mvhd` and `trak`. `trak` holds `tkhd` only.
@@ -20,23 +20,23 @@
 //! and that bitstream is the `mdat` body. Decode calls `decompress_zlib_bounded`
 //! and `Nv12Surface::to_rgba_bt709`.
 //!
+//! [`codecs`] adds:
+//! - [`codecs::AdctStream`]: 8x8 integer DCT/IDCT (`I420` 4:2:0) `I-frame` and motion-estimated `P-frame` video codec (`ADCT`).
+//! - [`codecs::AudioTrack`], [`codecs::FlacFrame`], and [`codecs::OpusMdctPacket`]: PCM16, 4-bit IMA-ADPCM (`AAUD`), lossless `fLaC` linear prediction + Rice coding, and 256-sample windowed MDCT audio, plus [`codecs::AvMediaContainer`] (`AAVM`).
+//! - [`codecs::Fmp4InitSegment`], [`codecs::Fmp4MediaSegment`], and [`codecs::WebmSegment`]: fragmented MP4 (`moov`/`mvex` + `moof`/`traf`/`trun`/`mdat`) and WebM/EBML (`Segment`/`Tracks`/`Cluster`/`SimpleBlock`) muxing and demuxing, plus [`codecs::MediaSourceBuffer`], [`codecs::WebVideoDecoder`], and [`codecs::WebVideoEncoder`].
+//! - [`codecs::Vp8KeyFrameHeader`], [`codecs::Vp9UncompressedHeader`], [`codecs::Av1SequenceHeaderObu`], and [`codecs::OpusTocHeader`]: specification header parsers, loop-filter/CDEF/WHT/ADST transform helpers, and `ADCT`/`OpusMdct`-backed stream framing (`V8SF`, `VP9F`, `AV1F`, `OPUS`).
+//!
 //! Sample encryption uses a 16-byte AES-128 key and a 16-byte IV, which is the
 //! initial CTR counter. [`cenc_encrypt_sample`] and [`cenc_decrypt_sample`] both
 //! call `aes128_ctr`. The whole `AVID` buffer is one sample. There are no per-frame
 //! subsample ranges.
 //!
-//! Three sibling crates are called, and only for these calls:
+//! Three sibling crates are called:
 //! - `anvil-compress`: `compress_zlib` on encode, `decompress_zlib_bounded` on decode.
 //! - `anvil-cipher`: `aes128_ctr` from both sample functions above.
-//! - `anvil-gpu`: `convert_rgba_on_device` and `present_nv12_on_device` when the
-//!   hardware flag is set. Those calls shade through the tile device. The flag-off
-//!   path still uses `Nv12Surface` directly.
+//! - `anvil-gpu`: `Compositor` for scaled RGBA/NV12/I420 frame blits, `Nv12Surface` and `I420Surface` for BT.709 color conversion, and `convert_rgba_on_device` / `present_nv12_on_device` when the hardware flag is set.
 //!
-//! Not implemented: a hardware decoder, a GPU decode or encode session, H.264, AV1,
-//! and a full sample-encryption layout (no `senc`, `saiz`, `saio`, or subsample
-//! pattern). [`GpuVideoSession`] stores a backend label, two flags, two counters,
-//! and an in-memory demo key list. It does not open a device. A video element is
-//! not parsed here.
+//! Not implemented: a hardware video decoder or encoder, real entropy-decoded H.264/HEVC/VP8/VP9/AV1/Opus bitstreams from external files, or a full `cenc` subsample encryption layout (`senc`, `saiz`, `saio`). [`GpuVideoSession`] stores a backend label, two flags, two counters, and an in-memory demo key list; it does not open a hardware video decoder device.
 //!
 //! Limits checked in this file: [`MAX_VIDEO_WIDTH`] 4096, [`MAX_VIDEO_HEIGHT`] 2160,
 //! [`MAX_VIDEO_PIXELS`], [`MAX_VIDEO_FRAMES`] 36000, [`MAX_PACKET_BYTES`] 16 MiB,
