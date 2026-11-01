@@ -8,7 +8,7 @@
 
 [package]
 name = "anvil-video"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.99.1"
 authors = ["Buntato"]
@@ -23,5 +23,4 @@ publish = false
 
 [dependencies]
 anvil-cipher = { path = "../anvil-cipher" }
-anvil-compress = { path = "../anvil-compress" }
 anvil-gpu = { path = "../anvil-gpu" }

@@ -17,4 +17,4 @@ Do not put the details in a public issue.
 - No hardware decoder. The Direct3D and VA-API names are labels.
 - No license-server CDM. Keys in `CdmSession` are local.
 
-Version 0.9.0 is current.
+Version 0.10.0 is current.

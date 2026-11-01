@@ -5,7 +5,7 @@
 //! `WebM`/`EBML` containers, Windows Media Foundation / D3D11 Video probing, and
 //! W3C `WebCodecs` / `MSE` (`SourceBuffer`) engines.
 
-use anvil_compress::{compress_zlib, decompress_zlib_bounded};
+use crate::anvil_compress::{compress_zlib, decompress_zlib_bounded};
 use anvil_gpu::I420Surface;
 
 use crate::{
@@ -567,25 +567,10 @@ pub fn encode_av1_obu_stream(
     qp: u8,
     frames: &[VideoFrame],
 ) -> Result<Vec<u8>, VideoError> {
-    let adct = encode_dct_mc_bitstream(VideoCodecProfile::Av1Main, fps, qp, frames)?;
-    let width = frames[0].width;
-    let height = frames[0].height;
-    let mut out = Vec::with_capacity(24 + adct.len());
-    // OBU Temporal Delimiter (header 0x12, size 0)
-    out.extend_from_slice(&[0x12, 0x00]);
-    // OBU Sequence Header (header 0x0A, size 12, magic "AV01", width, height)
-    out.extend_from_slice(&[0x0A, 12]);
-    out.extend_from_slice(b"AV01");
-    out.extend_from_slice(&width.to_be_bytes());
-    out.extend_from_slice(&height.to_be_bytes());
-    // OBU Frame (header 0x32) + 4-byte length + ADCT payload
-    out.push(0x32);
-    out.extend_from_slice(&(adct.len() as u32).to_be_bytes());
-    out.extend_from_slice(&adct);
-    Ok(out)
+    crate::av1::encode_av1_bitstream(fps, qp, frames)
 }
 
-/// Decode an AV1 (`av01`) OBU stream into a [`VideoClip`].
+/// Decode an AV1 (`av01`) OBU stream (or legacy `ADCT`-wrapped AV1 stream) into a [`VideoClip`].
 pub fn decode_av1_obu_stream(data: &[u8], hardware_decode: bool) -> Result<VideoClip, VideoError> {
     if data.len() < 21 || &data[0..2] != &[0x12, 0x00] || data[2] != 0x0A || &data[4..8] != b"AV01"
     {
@@ -598,7 +583,10 @@ pub fn decode_av1_obu_stream(data: &[u8], hardware_decode: bool) -> Result<Video
     if 21 + payload_len > data.len() {
         return Err(VideoError::CorruptedBitstream);
     }
-    decode_dct_mc_bitstream(&data[21..21 + payload_len], hardware_decode)
+    if payload_len >= 4 && &data[21..25] == b"ADCT" {
+        return decode_dct_mc_bitstream(&data[21..21 + payload_len], hardware_decode);
+    }
+    crate::av1::decode_av1_bitstream(data, hardware_decode)
 }
 
 // ============================================================================
@@ -1893,19 +1881,14 @@ impl<'a> OpusRangeDecoder<'a> {
     }
 }
 
-/// Encode an [`AudioTrack`] into an RFC 6716 Opus stream (`Opus` TOC byte + MDCT payload).
+/// Encode an [`AudioTrack`] into a specification-compliant RFC 6716 Opus packet
+/// (`Opus` TOC header + range-coded CELT/SILK frames).
 pub fn encode_rfc6716_opus_packet(track: &AudioTrack) -> Result<Vec<u8>, VideoError> {
-    let mdct = encode_mdct_audio_stream(track)?;
-    // TOC byte: config 31 (CELT Fullband 20ms) = 31 << 3 = 0xF8, stereo bit 0x04, code 0 (1 frame)
-    let toc = 0xF8u8 | if track.channels >= 2 { 0x04 } else { 0x00 };
-    let mut out = Vec::with_capacity(1 + mdct.len());
-    out.push(toc);
-    out.extend_from_slice(&mdct);
-    Ok(out)
+    crate::opus::encode_opus_rfc6716_bitstream(track, OpusMode::CeltOnly)
 }
 
-/// Decode an RFC 6716 Opus packet (either containing an embedded `MDCT` frame or raw
-/// range-coded coefficients) into 48 kHz [`AudioTrack`] PCM samples.
+/// Decode an RFC 6716 Opus packet (either a range-coded CELT/SILK RFC 6716 bitstream
+/// or a legacy `MDCT`-tagged payload) into 48 kHz [`AudioTrack`] PCM samples.
 pub fn decode_rfc6716_opus_packet(packet: &[u8]) -> Result<AudioTrack, VideoError> {
     if packet.len() >= 4 && &packet[0..4] == b"MDCT" {
         return decode_mdct_audio_stream(packet);
@@ -1915,39 +1898,7 @@ pub fn decode_rfc6716_opus_packet(packet: &[u8]) -> Result<AudioTrack, VideoErro
     if body.len() >= 4 && &body[0..4] == b"MDCT" {
         return decode_mdct_audio_stream(body);
     }
-
-    // Raw packet path: a simple LPC test synthesis, not real SILK or CELT
-    let channels = if header.stereo { 2u8 } else { 1u8 };
-    let samples_per_ch = header.samples_per_frame_48k() * (header.frame_count as usize);
-    let total_samples = samples_per_ch * (channels as usize);
-    if total_samples * 2 > MAX_PACKET_BYTES {
-        return Err(VideoError::PacketTooLarge {
-            size: total_samples * 2,
-        });
-    }
-    let mut rd = OpusRangeDecoder::new(body);
-    let mut samples = vec![0i16; total_samples];
-    let ch = channels as usize;
-    let mut lpc_prev1 = [0i32; 2];
-    let mut lpc_prev2 = [0i32; 2];
-
-    for i in 0..samples_per_ch {
-        for c in 0..ch {
-            let exc = (rd.decode_uint(512) as i32) - 256;
-            let pred = (lpc_prev1[c] * 3 - lpc_prev2[c]) >> 2;
-            let s = (pred + exc * 16).clamp(-32768, 32767);
-            lpc_prev2[c] = lpc_prev1[c];
-            lpc_prev1[c] = s;
-            samples[i * ch + c] = s as i16;
-        }
-    }
-
-    Ok(AudioTrack {
-        sample_rate: 48_000,
-        channels,
-        codec: AudioCodecProfile::OpusMdct,
-        samples,
-    })
+    crate::opus::decode_opus_rfc6716_bitstream(packet)
 }
 
 /// Parsed IETF RFC 6386 Section 9.1 VP8 uncompressed frame header.
@@ -2153,45 +2104,35 @@ pub fn vp8_loop_filter_edge(p1: u8, p0: u8, q0: u8, q1: u8, limit: i32) -> (u8, 
     (new_p0, new_q0)
 }
 
-/// Encode [`VideoFrame`]s as an RFC 6386 VP8 (`vp08`) bitstream with a 10-byte uncompressed
-/// keyframe header (`[0x9D, 0x01, 0x2A]` start code + 14-bit dimensions) and DCT/MC payload.
+/// Encode [`VideoFrame`]s as a specification-compliant RFC 6386 VP8 (`vp08`) bitstream
+/// with a 10-byte uncompressed keyframe header (`[0x9D, 0x01, 0x2A]` start code + 14-bit dimensions),
+/// Partition 0 boolean-coded macroblock modes, and Partition 1 DCT/WHT token trees.
 pub fn encode_vp8_rfc6386_stream(
     fps: u32,
     qp: u8,
     frames: &[VideoFrame],
 ) -> Result<Vec<u8>, VideoError> {
-    let adct = encode_dct_mc_bitstream(VideoCodecProfile::Vp8Profile0, fps, qp, frames)?;
-    let width = frames[0].width as u16;
-    let height = frames[0].height as u16;
-    // 3-byte frame tag: keyframe (0), version 0, show_frame 1 (0x10), first_part_size = 16
-    let tag: u32 = (1 << 4) | (16 << 5);
-    let mut out = Vec::with_capacity(14 + adct.len());
-    out.push((tag & 0xFF) as u8);
-    out.push(((tag >> 8) & 0xFF) as u8);
-    out.push(((tag >> 16) & 0xFF) as u8);
-    out.extend_from_slice(&[0x9D, 0x01, 0x2A]);
-    out.extend_from_slice(&(width & 0x3FFF).to_le_bytes());
-    out.extend_from_slice(&(height & 0x3FFF).to_le_bytes());
-    out.extend_from_slice(&(adct.len() as u32).to_be_bytes());
-    out.extend_from_slice(&adct);
-    Ok(out)
+    crate::vp8::encode_vp8_rfc6386_bitstream(fps, qp, frames)
 }
 
-/// Decode an RFC 6386 VP8 (`vp08`) bitstream into a [`VideoClip`].
+/// Decode an RFC 6386 VP8 (`vp08`) bitstream (or legacy `ADCT`-wrapped VP8 stream) into a [`VideoClip`].
 pub fn decode_vp8_rfc6386_stream(
     data: &[u8],
     hardware_decode: bool,
 ) -> Result<VideoClip, VideoError> {
     let header = Vp8FrameHeader::parse(data)?;
-    if !header.is_keyframe || data.len() < 14 {
+    if !header.is_keyframe || data.len() < 11 {
         return Err(VideoError::InvalidHeader);
     }
     validate_video_dimensions(header.width as u32, header.height as u32)?;
-    let payload_len = u32::from_be_bytes([data[10], data[11], data[12], data[13]]) as usize;
-    if 14 + payload_len > data.len() {
-        return Err(VideoError::CorruptedBitstream);
+    if data.len() >= 18 && &data[14..18] == b"ADCT" {
+        let payload_len = u32::from_be_bytes([data[10], data[11], data[12], data[13]]) as usize;
+        if 14 + payload_len > data.len() {
+            return Err(VideoError::CorruptedBitstream);
+        }
+        return decode_dct_mc_bitstream(&data[14..14 + payload_len], hardware_decode);
     }
-    decode_dct_mc_bitstream(&data[14..14 + payload_len], hardware_decode)
+    crate::vp8::decode_vp8_rfc6386_bitstream(data, hardware_decode)
 }
 
 /// Parsed VP9 uncompressed frame header (`frame_marker == 0b10` and `[0x49, 0x83, 0x42]` sync code).
@@ -2273,32 +2214,24 @@ pub fn parse_vp9_superframe_index(packet: &[u8]) -> Option<Vec<usize>> {
 
 /// Encode [`VideoFrame`]s as a VP9 (`vp09`) bitstream with sync code `[0x49, 0x83, 0x42]`.
 pub fn encode_vp9_stream(fps: u32, qp: u8, frames: &[VideoFrame]) -> Result<Vec<u8>, VideoError> {
-    let adct = encode_dct_mc_bitstream(VideoCodecProfile::Vp9Profile0, fps, qp, frames)?;
-    let w_minus_1 = (frames[0].width.saturating_sub(1)) as u16;
-    let h_minus_1 = (frames[0].height.saturating_sub(1)) as u16;
-    let mut out = Vec::with_capacity(12 + adct.len());
-    // 0x82 = frame_marker 0b10, profile 0, show_existing 0, frame_type 0 (key), show_frame 1, resilient 0
-    out.push(0x82);
-    out.extend_from_slice(&[0x49, 0x83, 0x42]);
-    out.extend_from_slice(&w_minus_1.to_be_bytes());
-    out.extend_from_slice(&h_minus_1.to_be_bytes());
-    out.extend_from_slice(&(adct.len() as u32).to_be_bytes());
-    out.extend_from_slice(&adct);
-    Ok(out)
+    crate::vp9::encode_vp9_bitstream(fps, qp, frames)
 }
 
-/// Decode a VP9 (`vp09`) bitstream into a [`VideoClip`].
+/// Decode a VP9 (`vp09`) bitstream (or legacy `ADCT`-wrapped VP9 stream) into a [`VideoClip`].
 pub fn decode_vp9_stream(data: &[u8], hardware_decode: bool) -> Result<VideoClip, VideoError> {
     let header = Vp9FrameHeader::parse(data)?;
     validate_video_dimensions(header.width, header.height)?;
     if data.len() < 12 {
         return Err(VideoError::CorruptedBitstream);
     }
-    let payload_len = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
-    if 12 + payload_len > data.len() {
-        return Err(VideoError::CorruptedBitstream);
+    if data.len() >= 16 && &data[12..16] == b"ADCT" {
+        let payload_len = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        if 12 + payload_len > data.len() {
+            return Err(VideoError::CorruptedBitstream);
+        }
+        return decode_dct_mc_bitstream(&data[12..12 + payload_len], hardware_decode);
     }
-    decode_dct_mc_bitstream(&data[12..12 + payload_len], hardware_decode)
+    crate::vp9::decode_vp9_bitstream(data, hardware_decode)
 }
 
 /// Read an unsigned LEB128 integer (`leb128()`) from an AOMedia AV1 Open Bitstream Unit (`OBU`),

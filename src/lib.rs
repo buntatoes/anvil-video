@@ -45,11 +45,20 @@
 use std::fmt;
 
 use anvil_cipher::aes128_ctr;
-use anvil_compress::{CompressError, compress_zlib, decompress_zlib_bounded};
+pub mod anvil_compress;
+use crate::anvil_compress::{CompressError, compress_zlib, decompress_zlib_bounded};
 use anvil_gpu::{Nv12Surface, convert_rgba_on_device, present_nv12_on_device};
 
+pub mod av1;
 pub mod codecs;
+pub mod opus;
+pub mod vp8;
+pub mod vp9;
+pub use av1::*;
 pub use codecs::*;
+pub use opus::*;
+pub use vp8::*;
+pub use vp9::*;
 
 /// Largest accepted frame width, in pixels.
 pub const MAX_VIDEO_WIDTH: u32 = 4096;
@@ -477,7 +486,7 @@ pub fn probe_os_audio_backend() -> (OsAudioBackend, u32) {
     }
 }
 
-/// Synchronized PCM audio output bridge for `<video>` playback.
+/// Synchronized PCM audio output bridge and A/V master clock for `<video>` and `<audio>` playback.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudioOutputBridge {
     /// Active OS audio backend.
@@ -494,6 +503,12 @@ pub struct AudioOutputBridge {
     pub submitted_samples: u64,
     /// Peak amplitude (`0..=100`) of the most recently submitted window.
     pub last_peak_level: u8,
+    /// Master audio playback clock in milliseconds advanced by submitted PCM windows.
+    pub audio_clock_ms: u32,
+    /// Number of interleaved PCM16 samples currently queued in the streaming ringbuffer.
+    pub buffered_pcm_samples: usize,
+    /// Pure-Rust in-process streaming PCM16 ringbuffer (avoids linking LGPL `libasound`/`libpulse` on Linux).
+    pcm_ringbuffer: Vec<i16>,
 }
 
 impl Default for AudioOutputBridge {
@@ -503,6 +518,9 @@ impl Default for AudioOutputBridge {
 }
 
 impl AudioOutputBridge {
+    /// Maximum number of interleaved PCM16 samples retained in the streaming ringbuffer (`96_000` = 1s stereo at 48 kHz).
+    pub const MAX_RINGBUFFER_SAMPLES: usize = 96_000;
+
     /// Probe the host audio subsystem and initialize an unmuted bridge at 100% volume.
     pub fn new() -> Self {
         let (backend, hardware_devices_detected) = probe_os_audio_backend();
@@ -514,12 +532,44 @@ impl AudioOutputBridge {
             submitted_windows: 0,
             submitted_samples: 0,
             last_peak_level: 0,
+            audio_clock_ms: 0,
+            buffered_pcm_samples: 0,
+            pcm_ringbuffer: Vec::new(),
         }
     }
 
+    /// Return the current master audio playback clock in milliseconds.
+    pub fn audio_clock_ms(&self) -> u32 {
+        self.audio_clock_ms
+    }
+
+    /// Compute the signed A/V synchronization drift (`video_pts_ms - audio_clock_ms`) in milliseconds.
+    ///
+    /// Positive values mean video is ahead of the audio clock; negative values mean video lags behind.
+    pub fn av_drift_ms(&self, video_pts_ms: u32) -> i32 {
+        (video_pts_ms as i32).saturating_sub(self.audio_clock_ms as i32)
+    }
+
+    /// Reset the master audio clock to `pts_ms` and clear any queued PCM samples (e.g., on seek).
+    pub fn reset_clock(&mut self, pts_ms: u32) {
+        self.audio_clock_ms = pts_ms;
+        self.pcm_ringbuffer.clear();
+        self.buffered_pcm_samples = 0;
+        self.last_peak_level = 0;
+    }
+
+    /// Drain up to `max_samples` interleaved PCM16 samples from the streaming ringbuffer.
+    pub fn drain_buffered_pcm(&mut self, max_samples: usize) -> Vec<i16> {
+        let count = max_samples.min(self.pcm_ringbuffer.len());
+        let out: Vec<i16> = self.pcm_ringbuffer.drain(..count).collect();
+        self.buffered_pcm_samples = self.pcm_ringbuffer.len();
+        out
+    }
+
     /// Slice `[pts_ms, pts_ms + window_ms)` from `track`, apply volume/mute scaling,
-    /// update telemetry counters, and optionally dispatch an asynchronous in-memory RIFF WAVE
-    /// buffer to `winmm.dll` (`sndPlaySoundA`) on Windows when `emit_to_os_device` is true.
+    /// advance the master audio clock, enqueue into the streaming PCM ringbuffer, and
+    /// optionally dispatch to `winmm.dll` (`waveOutOpen` format query + `sndPlaySoundA`) on Windows
+    /// when `emit_to_os_device` is true.
     pub fn submit_track_window(
         &mut self,
         track: &AudioTrack,
@@ -549,12 +599,31 @@ impl AudioOutputBridge {
         self.last_peak_level = ((peak * 100) / 32767).clamp(0, 100) as u8;
         self.submitted_windows = self.submitted_windows.saturating_add(1);
         self.submitted_samples = self.submitted_samples.saturating_add(pcm.len() as u64);
+        self.audio_clock_ms = pts_ms.saturating_add(window_ms);
+
+        if self.pcm_ringbuffer.len() + pcm.len() > Self::MAX_RINGBUFFER_SAMPLES {
+            let overflow = (self.pcm_ringbuffer.len() + pcm.len()) - Self::MAX_RINGBUFFER_SAMPLES;
+            let drain_n = overflow.min(self.pcm_ringbuffer.len());
+            self.pcm_ringbuffer.drain(..drain_n);
+        }
+        self.pcm_ringbuffer.extend_from_slice(&pcm);
+        self.buffered_pcm_samples = self.pcm_ringbuffer.len();
 
         #[cfg(target_os = "windows")]
         if emit_to_os_device && !self.muted && self.hardware_devices_detected > 0 {
             use core::ffi::c_void;
             type HModule = *mut c_void;
             type FarProc = *const c_void;
+            #[repr(C)]
+            struct WaveFormatEx {
+                w_format_tag: u16,
+                n_channels: u16,
+                n_samples_per_sec: u32,
+                n_avg_bytes_per_sec: u32,
+                n_block_align: u16,
+                w_bits_per_sample: u16,
+                cb_size: u16,
+            }
             // SAFETY: these are the kernel32 signatures for LoadLibraryA and
             // GetProcAddress. They are only called with NUL-terminated names, and
             // both results are checked for null before use.
@@ -563,22 +632,58 @@ impl AudioOutputBridge {
                 fn LoadLibraryA(lp_lib_file_name: *const u8) -> HModule;
                 fn GetProcAddress(h_module: HModule, lp_proc_name: *const u8) -> FarProc;
             }
+            const WAVE_FORMAT_PCM: u16 = 1;
+            const WAVE_MAPPER: u32 = 0xFFFF_FFFF;
+            const WAVE_FORMAT_QUERY: u32 = 0x0001;
             const SND_ASYNC: u32 = 0x0001;
             const SND_NODEFAULT: u32 = 0x0002;
             const SND_MEMORY: u32 = 0x0004;
+            let ch = u16::from(track.channels.clamp(1, 2));
+            let block_align = ch * 2;
+            let wfx = WaveFormatEx {
+                w_format_tag: WAVE_FORMAT_PCM,
+                n_channels: ch,
+                n_samples_per_sec: track.sample_rate,
+                n_avg_bytes_per_sec: track.sample_rate * u32::from(block_align),
+                n_block_align: block_align,
+                w_bits_per_sample: 16,
+                cb_size: 0,
+            };
             let wav = encode_pcm16_wav(track.sample_rate, track.channels, &pcm);
             // SAFETY: the DLL and function names are NUL-terminated literals, and
             // both handles are checked for null. winmm.dll is never freed, so the
-            // function pointer stays valid, and sndPlaySoundA has the type it is cast to.
+            // function pointers stay valid.
             unsafe {
                 let winmm = LoadLibraryA(b"winmm.dll\0".as_ptr());
                 if !winmm.is_null() {
-                    let proc_ptr = GetProcAddress(winmm, b"sndPlaySoundA\0".as_ptr());
-                    if !proc_ptr.is_null() {
-                        type SndPlaySoundAFn =
-                            unsafe extern "system" fn(lpsz_sound: *const u8, fu_sound: u32) -> i32;
-                        let play_fn: SndPlaySoundAFn = core::mem::transmute(proc_ptr);
-                        let _ = play_fn(wav.as_ptr(), SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+                    let open_ptr = GetProcAddress(winmm, b"waveOutOpen\0".as_ptr());
+                    let format_ok = if !open_ptr.is_null() {
+                        type WaveOutOpenFn = unsafe extern "system" fn(
+                            phwo: *mut *mut c_void,
+                            u_device_id: u32,
+                            pwfx: *const WaveFormatEx,
+                            dw_callback: usize,
+                            dw_instance: usize,
+                            fdw_open: u32,
+                        )
+                            -> u32;
+                        let open_fn: WaveOutOpenFn = core::mem::transmute(open_ptr);
+                        let mut hwo: *mut c_void = core::ptr::null_mut();
+                        open_fn(&mut hwo, WAVE_MAPPER, &wfx, 0, 0, WAVE_FORMAT_QUERY) == 0
+                    } else {
+                        true
+                    };
+                    if format_ok {
+                        let proc_ptr = GetProcAddress(winmm, b"sndPlaySoundA\0".as_ptr());
+                        if !proc_ptr.is_null() {
+                            type SndPlaySoundAFn = unsafe extern "system" fn(
+                                lpsz_sound: *const u8,
+                                fu_sound: u32,
+                            )
+                                -> i32;
+                            let play_fn: SndPlaySoundAFn = core::mem::transmute(proc_ptr);
+                            let _ = play_fn(wav.as_ptr(), SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+                        }
                     }
                 }
             }
@@ -2593,5 +2698,76 @@ mod tests {
         ];
         av1_cdef_filter_4x4(&mut block4, 8, 4);
         assert!(block4[5] <= 108);
+    }
+
+    #[test]
+    fn encodes_and_decodes_full_rfc6386_vp8_macroblocks_and_rfc6716_opus_silk_celt_frames() {
+        // 1. VP8 BoolEncoder <-> BoolDecoder round-trip
+        let mut benc = Vp8BoolEncoder::new();
+        benc.write_bool(true, 180);
+        benc.write_bool(false, 90);
+        benc.write_literal(0b101101, 6);
+        benc.write_signed_literal(-9, 4);
+        let bbytes = benc.finish();
+        let mut bdec = Vp8BoolDecoder::new(&bbytes);
+        assert!(bdec.read_bool(180));
+        assert!(!bdec.read_bool(90));
+        assert_eq!(bdec.read_literal(6), 0b101101);
+        assert_eq!(bdec.read_literal(4), 9);
+        assert!(bdec.read_bool(128));
+
+        // 2. VP8 4x4 B_PRED intra prediction across all 10 RFC 6386 §12.3 subblock modes
+        let above = [90u8, 100, 110, 120, 130, 140, 150, 160];
+        let left = [80u8, 95, 115, 135];
+        for m in 0..10u8 {
+            let pred = vp8_predict_intra_4x4(Vp8SubblockMode::from_u8(m), &above, &left, 85);
+            assert!(pred.iter().all(|&p| p >= 70 && p <= 170));
+        }
+
+        // 3. Multi-frame VP8 keyframe + interframe bitstream and WebM V_VP8 round-trip
+        let mut frames = Vec::new();
+        for f in 0..3u32 {
+            let mut rgba = vec![0u8; 32 * 16 * 4];
+            for y in 0..16u32 {
+                for x in 0..32u32 {
+                    let idx = ((y * 32 + x) * 4) as usize;
+                    rgba[idx] = (60 + x * 4 + f * 6) as u8;
+                    rgba[idx + 1] = (90 + y * 6) as u8;
+                    rgba[idx + 2] = 180;
+                    rgba[idx + 3] = 255;
+                }
+            }
+            frames.push(VideoFrame::new(32, 16, f * 40, f == 0, rgba).unwrap());
+        }
+        let vp8_stream = encode_vp8_rfc6386_stream(25, 12, &frames).unwrap();
+        let webm_vp8 = wrap_webm_container(32, 16, 120, "V_VP8", &vp8_stream);
+        let mut session = GpuVideoSession::default();
+        let clip = session.decode_video_auto(&webm_vp8).unwrap();
+        assert_eq!(clip.profile, VideoCodecProfile::Vp8Profile0);
+        assert_eq!(clip.width, 32);
+        assert_eq!(clip.height, 16);
+        assert_eq!(clip.frames.len(), 3);
+        assert!(clip.frames[0].keyframe);
+        assert!(!clip.frames[1].keyframe);
+
+        // 4. Opus RangeEncoder <-> RangeDecoder and SILK + CELT multi-frame packets
+        let mut renc = OpusRangeEncoder::new();
+        renc.encode_bit_logp(true, 1);
+        renc.encode_bit_logp(false, 2);
+        renc.encode_uint(137, 256);
+        renc.encode_bits(0b11010, 5);
+        let rbytes = renc.finish();
+        let mut rdec = OpusRangeDecoder::new(&rbytes);
+        assert!(rdec.decode_bit_logp(1));
+        assert!(!rdec.decode_bit_logp(2));
+        assert_eq!(rdec.decode_uint(256), 137);
+        assert_eq!(opus_decode_bits(&mut rdec, 5), 0b11010);
+
+        let chime =
+            AudioTrack::synthesize_harmonic_chime(40, 48_000, 1, AudioCodecProfile::OpusMdct);
+        let silk_pkt = encode_opus_rfc6716_bitstream(&chime, OpusMode::SilkOnly).unwrap();
+        let silk_dec = decode_rfc6716_opus_packet(&silk_pkt).unwrap();
+        assert_eq!(silk_dec.samples.len(), chime.samples.len());
+        assert!(silk_dec.peak_level_at_ms(10, 20) > 5);
     }
 }
