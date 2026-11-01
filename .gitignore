@@ -1,2 +1,5 @@
-/target
-Cargo.lock
+/anvil-video
+/anvil-video.exe
+*.exe
+*.test
+*.out
